@@ -64,7 +64,7 @@ def close_put(endpoint, data):
 # ─── ATTENTION API ────────────────────────────────────────────────────────────
 def get_attention_calls():
     """Fetch recent scored calls from Attention, filtered to sales call types."""
-    from_dt = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).isoformat()
+    from_dt = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = "https://api.attention.tech/v2/conversations"
     params = {
         "filter[hide_non_analyzed]": "true",
