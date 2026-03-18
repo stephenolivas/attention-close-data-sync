@@ -1,0 +1,28 @@
+name: Attention → Close QA Sync
+
+on:
+  workflow_dispatch: # Triggered by cron-job.org every hour
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run QA Sync
+        env:
+          ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 -u sync.py
