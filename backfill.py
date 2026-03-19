@@ -25,11 +25,12 @@ QA_FIELD_ID       = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
 PACIFIC           = ZoneInfo("America/Los_Angeles")
 BACKFILL_FROM     = "2026-01-22T00:00:00Z"
 
-VALID_TITLE_KEYWORDS = [
-    "vendingpreneurs consultation",
-    "vendingprenuers consultation",
-    "vending strategy call with vendingpreneurs",
-    "vendingpreneurs strategy call",
+# Match any title containing "vendingpren" (catches all Calendly spelling variants)
+# and excluding setter/discovery calls
+INVALID_TITLE_KEYWORDS = [
+    "quick discovery",
+    "discovery call",
+    "setter",
 ]
 
 # ─── CLOSE API ────────────────────────────────────────────────────────────────
@@ -69,7 +70,14 @@ def close_put(endpoint, data):
 def is_valid_title(title):
     if not title:
         return False
-    return any(kw in title.lower() for kw in VALID_TITLE_KEYWORDS)
+    lower = title.lower()
+    # Must contain some form of "vendingpren" (catches all spelling variants)
+    if "vendingpren" not in lower:
+        return False
+    # Exclude setter/discovery calls
+    if any(kw in lower for kw in INVALID_TITLE_KEYWORDS):
+        return False
+    return True
 
 def get_prospect_email(participants):
     for p in participants or []:
