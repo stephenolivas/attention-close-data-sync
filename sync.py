@@ -21,11 +21,12 @@ QA_FIELD_ID       = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
 LOOKBACK_HOURS    = 2
 PACIFIC           = ZoneInfo("America/Los_Angeles")
 
-VALID_TITLE_KEYWORDS = [
-    "vendingpreneurs consultation",
-    "vendingprenuers consultation",   # calendly misspelling
-    "vending strategy call with vendingpreneurs",
-    "vendingpreneurs strategy call",
+# Match any title containing "vendingpren" (catches all Calendly spelling variants)
+# and excluding setter/discovery calls
+INVALID_TITLE_KEYWORDS = [
+    "quick discovery",
+    "discovery call",
+    "setter",
 ]
 
 # ─── CLOSE API SESSION ────────────────────────────────────────────────────────
@@ -64,7 +65,7 @@ def close_put(endpoint, data):
 # ─── ATTENTION API ────────────────────────────────────────────────────────────
 def get_attention_calls():
     """Fetch recent scored calls from Attention, filtered to sales call types."""
-    from_dt = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    from_dt = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).isoformat()
     url = "https://api.attention.tech/v2/conversations"
     params = {
         "filter[hide_non_analyzed]": "true",
@@ -164,7 +165,11 @@ def is_valid_title(title):
     if not title:
         return False
     lower = title.lower()
-    return any(kw in lower for kw in VALID_TITLE_KEYWORDS)
+    if "vendingpren" not in lower:
+        return False
+    if any(kw in lower for kw in INVALID_TITLE_KEYWORDS):
+        return False
+    return True
 
 def get_prospect_email(participants):
     for p in participants or []:
