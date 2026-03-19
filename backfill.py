@@ -177,9 +177,14 @@ def main():
         if i % 25 == 0:
             print(f"  Progress: {i}/{len(lead_to_titles)}", flush=True)
 
-        data = close_get(f"lead/{lead_id}", params={
-            "_fields": f"id,display_name,contacts,{QA_FIELD_ID}"
-        })
+        try:
+            data = close_get(f"lead/{lead_id}", params={
+                "_fields": f"id,display_name,contacts,{QA_FIELD_ID}"
+            })
+        except Exception as e:
+            if "404" in str(e):
+                continue  # Lead was deleted from Close, skip silently
+            raise
 
         existing_score = data.get(QA_FIELD_ID)
 
