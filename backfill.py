@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Attention → Close QA Score Backfill & Cleanup
+Attention → Close QA Score Backfill
 
-Efficient Close-first approach:
-1. Clear leads with QA score = 0
-2. Fetch all Close meetings → get unique leads → find ones missing scores
-3. For those leads only, find matching Attention call and write score
+ONLY writes scores to Close leads that:
+1. Had a Vendingpreneurs-type meeting in Close since Jan 22 2026
+2. Are currently missing a QA score (null/None only)
+3. Have a matching scored call in Attention
+
+Does NOT touch any other leads.
 """
 
 import os
@@ -20,7 +22,6 @@ CLOSE_API_KEY     = os.environ["CLOSE_API_KEY"]
 
 INTERNAL_DOMAIN   = "@modern-amenities.com"
 QA_FIELD_ID       = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
-QA_FIELD_SHORT    = "cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
 PACIFIC           = ZoneInfo("America/Los_Angeles")
 BACKFILL_FROM     = "2026-01-22T00:00:00Z"
 
@@ -97,57 +98,18 @@ def titles_match(attention_title, close_title):
             return True
     return False
 
-# ─── PHASE 1: CLEAR ZERO SCORES ───────────────────────────────────────────────
-def clear_zero_scores():
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    print("=== Attention → Close QA Score Backfill ===", flush=True)
+    print(f"Run time: {datetime.now(PACIFIC).strftime('%Y-%m-%d %H:%M %Z')}", flush=True)
+
+    # ── STEP 1: Paginate all Close meetings, collect lead_ids with valid titles ──
     print("\n" + "="*50, flush=True)
-    print("PHASE 1: Clearing leads with QA score = 0", flush=True)
+    print("STEP 1: Finding Close leads with Vendingpreneurs meetings...", flush=True)
     print("="*50, flush=True)
 
-    leads = []
-    skip = 0
-    page = 0
-    while True:
-        page += 1
-        data = close_get("lead/", params={
-            "_skip": skip,
-            "_limit": 100,
-            f"custom_fields[{QA_FIELD_SHORT}]": 0,
-            "_fields": "id,display_name",
-        })
-        batch = data.get("data", [])
-        leads.extend(batch)
-        print(f"  Page {page}: {len(batch)} leads (total: {len(leads)})", flush=True)
-        if not data.get("has_more"):
-            break
-        skip += 100
-
-    print(f"  Found {len(leads)} leads with score=0", flush=True)
-
-    cleared = 0
-    errors = 0
-    for lead in leads:
-        name = lead.get("display_name", "Unknown")
-        try:
-            close_put(f"lead/{lead['id']}/", {QA_FIELD_ID: None})
-            print(f"  🧹 Cleared \"{name}\"", flush=True)
-            cleared += 1
-        except Exception as e:
-            print(f"  ❌ Error clearing \"{name}\": {e}", flush=True)
-            errors += 1
-
-    print(f"\n  Cleared: {cleared} | Errors: {errors}", flush=True)
-    return cleared
-
-# ─── PHASE 2: BACKFILL MISSING SCORES ─────────────────────────────────────────
-def backfill_missing_scores():
-    print("\n" + "="*50, flush=True)
-    print("PHASE 2: Backfilling missing QA scores (Close-first)", flush=True)
-    print("="*50, flush=True)
-
-    # Step A: Paginate all Close meetings, collect unique lead_ids with valid titles
-    print("\nStep A: Fetching all Close meetings...", flush=True)
     from_dt = datetime(2026, 1, 22, tzinfo=PACIFIC)
-    lead_to_meetings = {}  # lead_id -> list of meeting titles
+    lead_to_titles = {}  # lead_id -> list of meeting titles
     skip = 0
     page = 0
 
@@ -159,9 +121,10 @@ def backfill_missing_scores():
             "_fields": "id,lead_id,title,starts_at,activity_at,date_start",
         })
         batch = data.get("data", [])
-        print(f"  Page {page}: {len(batch)} meetings", flush=True)
+        print(f"  Page {page}: {len(batch)} meetings fetched", flush=True)
 
         for m in batch:
+            # Filter by date in Python (Close ignores date params)
             raw = m.get("starts_at") or m.get("activity_at") or m.get("date_start")
             if not raw:
                 continue
@@ -171,55 +134,75 @@ def backfill_missing_scores():
                 continue
             if dt < from_dt:
                 continue
-            if not is_valid_title(m.get("title", "")):
+
+            # Only keep valid sales call types
+            title = m.get("title", "")
+            if not is_valid_title(title):
                 continue
+
             lead_id = m.get("lead_id")
             if not lead_id:
                 continue
-            if lead_id not in lead_to_meetings:
-                lead_to_meetings[lead_id] = []
-            lead_to_meetings[lead_id].append(m.get("title", ""))
+
+            if lead_id not in lead_to_titles:
+                lead_to_titles[lead_id] = []
+            lead_to_titles[lead_id].append(title)
 
         if not data.get("has_more"):
             break
         skip += 100
 
-    print(f"  Unique leads with valid meeting types: {len(lead_to_meetings)}", flush=True)
+    print(f"\n  Found {len(lead_to_titles)} unique leads with Vendingpreneurs meetings", flush=True)
 
-    # Step B: Fetch each unique lead, keep only those missing a QA score
-    print(f"\nStep B: Checking {len(lead_to_meetings)} leads for missing scores...", flush=True)
-    leads_needing_scores = []
+    if not lead_to_titles:
+        print("  No leads found. Exiting.", flush=True)
+        return
 
-    for i, (lead_id, meeting_titles) in enumerate(lead_to_meetings.items(), 1):
-        if i % 50 == 0:
-            print(f"  Checked {i}/{len(lead_to_meetings)} leads...", flush=True)
+    # ── STEP 2: Check each of those leads — keep only ones missing a QA score ──
+    print("\n" + "="*50, flush=True)
+    print(f"STEP 2: Checking {len(lead_to_titles)} leads for missing QA scores...", flush=True)
+    print("="*50, flush=True)
+
+    leads_to_fill = []
+
+    for i, (lead_id, meeting_titles) in enumerate(lead_to_titles.items(), 1):
+        if i % 25 == 0:
+            print(f"  Progress: {i}/{len(lead_to_titles)}", flush=True)
+
         data = close_get(f"lead/{lead_id}", params={
             "_fields": f"id,display_name,contacts,{QA_FIELD_ID}"
         })
+
         existing_score = data.get(QA_FIELD_ID)
-        if existing_score is not None and existing_score != 0:
+
+        # ONLY proceed if score is truly null/None — skip zeros, skip existing scores
+        if existing_score is not None:
             continue
-        leads_needing_scores.append({
+
+        leads_to_fill.append({
             "lead_id": lead_id,
             "lead_name": data.get("display_name", "Unknown"),
             "contacts": data.get("contacts", []),
             "meeting_titles": meeting_titles,
         })
 
-    print(f"  Leads missing a QA score: {len(leads_needing_scores)}", flush=True)
+    print(f"\n  Leads with NULL QA score: {len(leads_to_fill)}", flush=True)
 
-    if not leads_needing_scores:
-        print("  Nothing to backfill!", flush=True)
-        return 0
+    if not leads_to_fill:
+        print("  All leads already have scores. Nothing to do!", flush=True)
+        return
 
-    # Step C: Fetch all Attention calls (paginated)
-    print(f"\nStep C: Fetching all Attention calls...", flush=True)
+    # ── STEP 3: Fetch all Attention calls (paginated) ──────────────────────────
+    print("\n" + "="*50, flush=True)
+    print("STEP 3: Fetching all Attention scored calls...", flush=True)
+    print("="*50, flush=True)
+
     headers = {
         "Authorization": f"Bearer {ATTENTION_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    all_attention_calls = []
+    all_attention = []
     page = 1
     while True:
         resp = requests.get(
@@ -235,16 +218,16 @@ def backfill_missing_scores():
         )
         resp.raise_for_status()
         batch = resp.json().get("data", [])
-        all_attention_calls.extend(batch)
-        print(f"  Attention page {page}: {len(batch)} calls (total: {len(all_attention_calls)})", flush=True)
+        all_attention.extend(batch)
+        print(f"  Page {page}: {len(batch)} calls (total: {len(all_attention)})", flush=True)
         if len(batch) < 100:
             break
         page += 1
         time.sleep(0.3)
 
-    # Filter to valid scored calls
+    # Filter to valid scored sales calls only
     scored_calls = []
-    for call in all_attention_calls:
+    for call in all_attention:
         attrs = call.get("attributes", {})
         title = attrs.get("title", "")
         score_results = attrs.get("scorecardResults", [])
@@ -260,15 +243,18 @@ def backfill_missing_scores():
             "prospect_email": prospect_email,
         })
 
-    print(f"  Valid scored Attention calls: {len(scored_calls)}", flush=True)
+    print(f"\n  Valid scored Attention calls: {len(scored_calls)}", flush=True)
 
-    # Step D: For each Close lead missing a score, find matching Attention call
-    print(f"\nStep D: Matching and writing scores...", flush=True)
+    # ── STEP 4: Match each lead to an Attention call and write score ────────────
+    print("\n" + "="*50, flush=True)
+    print(f"STEP 4: Writing scores to {len(leads_to_fill)} leads...", flush=True)
+    print("="*50, flush=True)
+
     updated = 0
     no_match = 0
     errors = 0
 
-    for lead in leads_needing_scores:
+    for i, lead in enumerate(leads_to_fill, 1):
         lead_id   = lead["lead_id"]
         lead_name = lead["lead_name"]
         mtitles   = lead["meeting_titles"]
@@ -282,9 +268,9 @@ def backfill_missing_scores():
                 if e:
                     lead_emails.add(e)
 
-        print(f"\n  Lead: \"{lead_name}\"", flush=True)
+        print(f"\n[{i}/{len(leads_to_fill)}] \"{lead_name}\"", flush=True)
 
-        # Find best match: title + email first, title-only fallback
+        # Primary: title + email match. Fallback: title only
         best_match = None
         fallback_match = None
 
@@ -302,7 +288,7 @@ def backfill_missing_scores():
         match = best_match or fallback_match
 
         if not match:
-            print(f"  ❌ No Attention call match found", flush=True)
+            print(f"  ❌ No Attention match found", flush=True)
             no_match += 1
             continue
 
@@ -317,21 +303,12 @@ def backfill_missing_scores():
             print(f"  ❌ Error: {e}", flush=True)
             errors += 1
 
-    print(f"\n  Done. Updated: {updated} | No match: {no_match} | Errors: {errors}", flush=True)
-    return updated
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
-    print("=== Attention → Close QA Backfill & Cleanup ===", flush=True)
-    print(f"Run time: {datetime.now(PACIFIC).strftime('%Y-%m-%d %H:%M %Z')}", flush=True)
-
-    cleared = clear_zero_scores()
-    updated = backfill_missing_scores()
-
+    # ── SUMMARY ────────────────────────────────────────────────────────────────
     print("\n" + "="*50, flush=True)
-    print("=== All Done ===", flush=True)
-    print(f"🧹 Zero scores cleared: {cleared}", flush=True)
-    print(f"✅ Missing scores filled: {updated}", flush=True)
+    print("=== Backfill Complete ===", flush=True)
+    print(f"✅ Scores written: {updated}", flush=True)
+    print(f"❌ No match found: {no_match}", flush=True)
+    print(f"⚠️  Errors:        {errors}", flush=True)
 
 if __name__ == "__main__":
     main()
