@@ -2,17 +2,16 @@
 """
 Attention → Close QA Score Backfill & Cleanup (One-Time Run)
 
-- Fetches ALL Attention calls since Jan 22, 2026
-- Fetches ALL Close meetings
+- Fetches ALL Attention calls since Jan 22, 2026 (paginated)
+- Fetches ALL Close meetings (paginated)
 - Matches by title + email, writes correct QA scores
 - Clears QA scores from leads that have no matching Attention call
 """
 
 import os
-import sys
 import time
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -22,18 +21,16 @@ CLOSE_API_KEY     = os.environ["CLOSE_API_KEY"]
 INTERNAL_DOMAIN   = "@modern-amenities.com"
 QA_FIELD_ID       = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
 PACIFIC           = ZoneInfo("America/Los_Angeles")
-
-# Fetch all calls since go-live date
 BACKFILL_FROM     = "2026-01-22T00:00:00Z"
 
 VALID_TITLE_KEYWORDS = [
     "vendingpreneurs consultation",
-    "vendingprenuers consultation",   # calendly misspelling
+    "vendingprenuers consultation",
     "vending strategy call with vendingpreneurs",
     "vendingpreneurs strategy call",
 ]
 
-# ─── CLOSE API SESSION ────────────────────────────────────────────────────────
+# ─── CLOSE API ────────────────────────────────────────────────────────────────
 session = requests.Session()
 session.auth = (CLOSE_API_KEY, "")
 session.headers.update({"Content-Type": "application/json"})
@@ -66,28 +63,49 @@ def close_put(endpoint, data):
         return resp.json()
     resp.raise_for_status()
 
-# ─── ATTENTION API ────────────────────────────────────────────────────────────
+# ─── ATTENTION API (PAGINATED) ────────────────────────────────────────────────
 def get_all_attention_calls():
-    """Fetch all scored Attention calls since go-live date."""
+    """Fetch ALL scored Attention calls since go-live, handling pagination."""
     print(f"\nFetching ALL Attention calls since {BACKFILL_FROM}...", flush=True)
 
-    url = "https://api.attention.tech/v2/conversations"
-    params = {
-        "filter[hide_non_analyzed]": "true",
-        "fromDateTime": BACKFILL_FROM,
-    }
     headers = {
         "Authorization": f"Bearer {ATTENTION_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    resp = requests.get(url, params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    calls = resp.json().get("data", [])
-    print(f"  Total Attention calls returned: {len(calls)}", flush=True)
+    all_calls = []
+    page = 1
+    page_size = 100
 
+    while True:
+        params = {
+            "filter[hide_non_analyzed]": "true",
+            "fromDateTime": BACKFILL_FROM,
+            "page[size]": page_size,
+            "page[number]": page,
+        }
+        resp = requests.get(
+            "https://api.attention.tech/v2/conversations",
+            params=params,
+            headers=headers,
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("data", [])
+        all_calls.extend(batch)
+        print(f"  Page {page}: {len(batch)} calls (total so far: {len(all_calls)})", flush=True)
+
+        if len(batch) < page_size:
+            break
+        page += 1
+        time.sleep(0.3)
+
+    print(f"  Total Attention calls fetched: {len(all_calls)}", flush=True)
+
+    # Filter to valid sales calls with scores
     valid = []
-    for call in calls:
+    for call in all_calls:
         attrs = call.get("attributes", {})
         title = attrs.get("title", "")
         score_results = attrs.get("scorecardResults", [])
@@ -96,12 +114,10 @@ def get_all_attention_calls():
         if not is_valid_title(title):
             continue
         if score is None:
-            print(f"  Skip (no score yet): {title}", flush=True)
             continue
 
         prospect_email = get_prospect_email(attrs.get("participants", []))
         if not prospect_email:
-            print(f"  Skip (no external email): {title}", flush=True)
             continue
 
         valid.append({
@@ -113,31 +129,29 @@ def get_all_attention_calls():
     print(f"  Valid scored sales calls: {len(valid)}", flush=True)
     return valid
 
-# ─── CLOSE MEETINGS ───────────────────────────────────────────────────────────
+# ─── CLOSE DATA ───────────────────────────────────────────────────────────────
 def get_all_close_meetings():
-    """Paginate ALL Close meetings."""
-    print("\nFetching all Close meetings (paginating)...", flush=True)
+    """Paginate ALL Close meetings, filter to since go-live in Python."""
+    print("\nFetching all Close meetings...", flush=True)
     meetings = []
     skip = 0
-    limit = 100
     page = 0
 
     while True:
         page += 1
         data = close_get("activity/meeting/", params={
             "_skip": skip,
-            "_limit": limit,
+            "_limit": 100,
             "_fields": "id,lead_id,title,starts_at,activity_at,date_start",
         })
         batch = data.get("data", [])
         meetings.extend(batch)
-        print(f"  Page {page}: {len(batch)} meetings (total: {len(meetings)})", flush=True)
+        print(f"  Page {page}: {len(batch)} (total: {len(meetings)})", flush=True)
 
         if not data.get("has_more"):
             break
-        skip += limit
+        skip += 100
 
-    # Filter to only meetings since go-live
     from_dt = datetime(2026, 1, 22, tzinfo=PACIFIC)
     recent = []
     for m in meetings:
@@ -154,20 +168,19 @@ def get_all_close_meetings():
     print(f"  Meetings since Jan 22 2026: {len(recent)}", flush=True)
     return recent
 
-def get_all_leads_with_qa_scores():
-    """Fetch all Close leads that currently have a QA score set."""
-    print("\nFetching all Close leads with QA scores...", flush=True)
+def get_leads_with_qa_scores():
+    """Fetch only leads that currently have a QA score — used for cleanup."""
+    print("\nFetching leads with existing QA scores...", flush=True)
     leads = []
     skip = 0
-    limit = 100
     page = 0
 
     while True:
         page += 1
         data = close_get("lead/", params={
             "_skip": skip,
-            "_limit": limit,
-            f"custom_fields[{QA_FIELD_ID}][exists]": "true",
+            "_limit": 100,
+            "custom_fields[cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq][exists]": "true",
             "_fields": f"id,display_name,contacts,{QA_FIELD_ID}",
         })
         batch = data.get("data", [])
@@ -176,7 +189,7 @@ def get_all_leads_with_qa_scores():
 
         if not data.get("has_more"):
             break
-        skip += limit
+        skip += 100
 
     print(f"  Total leads with QA scores: {len(leads)}", flush=True)
     return leads
@@ -205,7 +218,6 @@ def titles_match(attention_title, close_title):
     if a == c:
         return True
 
-    # Extract prospect name from Attention title (before 'and vending')
     name_part = None
     for separator in [" and vending", " and vendingpren"]:
         if separator in a:
@@ -223,7 +235,6 @@ def titles_match(attention_title, close_title):
     return False
 
 def find_close_lead(attention_call, close_meetings, lead_cache):
-    """Match Attention call to Close lead via title + email."""
     prospect_email = attention_call["prospect_email"]
     attn_title = attention_call["title"]
 
@@ -241,14 +252,12 @@ def find_close_lead(attention_call, close_meetings, lead_cache):
             lead_cache[lead_id] = lead_data
 
         lead = lead_cache[lead_id]
-
-        # Verify email matches a contact on this lead
         for contact in lead.get("contacts", []):
             for email_obj in contact.get("emails", []):
                 if email_obj.get("email", "").lower() == prospect_email:
                     return lead_id, lead.get("display_name", "Unknown")
 
-    # Fallback: title match only
+    # Fallback: title only
     if title_matches:
         lead_id = title_matches[0].get("lead_id")
         if lead_id:
@@ -258,7 +267,7 @@ def find_close_lead(attention_call, close_meetings, lead_cache):
                 })
                 lead_cache[lead_id] = lead_data
             lead_name = lead_cache[lead_id].get("display_name", "Unknown")
-            print(f"  ⚠️  Title-only match (no email confirm): {lead_name}", flush=True)
+            print(f"  ⚠️  Title-only match: {lead_name}", flush=True)
             return lead_id, lead_name
 
     return None, None
@@ -266,22 +275,21 @@ def find_close_lead(attention_call, close_meetings, lead_cache):
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     print("=== Attention → Close QA Backfill & Cleanup ===", flush=True)
-    print(f"Backfill from: {BACKFILL_FROM}", flush=True)
     print(f"Run time: {datetime.now(PACIFIC).strftime('%Y-%m-%d %H:%M %Z')}", flush=True)
 
-    # Step 1: Get all valid Attention calls
+    # Step 1: Get all valid Attention calls (paginated)
     attention_calls = get_all_attention_calls()
 
     # Step 2: Get all Close meetings since go-live
     close_meetings = get_all_close_meetings()
 
-    # Step 3: Get all leads that currently have a QA score (for cleanup)
-    scored_leads = get_all_leads_with_qa_scores()
-    scored_lead_ids = {l["id"] for l in scored_leads}
+    # Step 3: Get only leads that currently have a QA score (for cleanup)
+    scored_leads = get_leads_with_qa_scores()
 
-    lead_cache = {}
-    legitimately_updated = set()  # lead_ids that get a valid score written
+    # Pre-populate cache with already-scored leads to avoid re-fetching
+    lead_cache = {l["id"]: l for l in scored_leads}
 
+    legitimately_updated = set()
     updated = 0
     already_correct = 0
     skipped = 0
@@ -289,18 +297,18 @@ def main():
 
     # ── PHASE 1: Write correct scores ────────────────────────────────────────
     print(f"\n{'='*50}", flush=True)
-    print("PHASE 1: Writing correct QA scores", flush=True)
+    print(f"PHASE 1: Writing correct QA scores ({len(attention_calls)} calls)", flush=True)
     print(f"{'='*50}", flush=True)
 
-    for call in attention_calls:
-        print(f"\nProcessing: \"{call['title']}\"", flush=True)
-        print(f"  Email: {call['prospect_email']} | Score: {call['score']}", flush=True)
+    for i, call in enumerate(attention_calls, 1):
+        print(f"\n[{i}/{len(attention_calls)}] \"{call['title']}\"", flush=True)
+        print(f"  {call['prospect_email']} | score={call['score']}", flush=True)
 
         try:
             lead_id, lead_name = find_close_lead(call, close_meetings, lead_cache)
 
             if not lead_id:
-                print(f"  ❌ No matching Close lead found — skipping", flush=True)
+                print(f"  ❌ No Close match found", flush=True)
                 skipped += 1
                 continue
 
@@ -308,12 +316,12 @@ def main():
 
             existing_score = lead_cache.get(lead_id, {}).get(QA_FIELD_ID)
             if existing_score == call["score"]:
-                print(f"  ⏭️  Score already correct ({existing_score})", flush=True)
+                print(f"  ⏭️  Already correct ({existing_score})", flush=True)
                 already_correct += 1
                 continue
 
             close_put(f"lead/{lead_id}/", {QA_FIELD_ID: call["score"]})
-            print(f"  ✅ Updated \"{lead_name}\": {existing_score} → {call['score']}", flush=True)
+            print(f"  ✅ \"{lead_name}\": {existing_score} → {call['score']}", flush=True)
             updated += 1
 
         except Exception as e:
@@ -326,24 +334,23 @@ def main():
     print(f"{'='*50}", flush=True)
 
     leads_to_clear = [l for l in scored_leads if l["id"] not in legitimately_updated]
-    print(f"  Leads with scores that had no Attention match: {len(leads_to_clear)}", flush=True)
+    print(f"  Leads to clear: {len(leads_to_clear)}", flush=True)
 
     cleared = 0
     for lead in leads_to_clear:
         lead_name = lead.get("display_name", "Unknown")
         bad_score = lead.get(QA_FIELD_ID)
-        print(f"  Clearing \"{lead_name}\" (bad score: {bad_score})...", flush=True)
+        print(f"  🧹 Clearing \"{lead_name}\" (score: {bad_score})", flush=True)
         try:
             close_put(f"lead/{lead['id']}/", {QA_FIELD_ID: None})
-            print(f"  ✅ Cleared", flush=True)
             cleared += 1
         except Exception as e:
-            print(f"  ❌ Error clearing: {e}", flush=True)
+            print(f"  ❌ Error: {e}", flush=True)
             errors += 1
 
     # ── SUMMARY ──────────────────────────────────────────────────────────────
     print(f"\n{'='*50}", flush=True)
-    print("=== Backfill & Cleanup Complete ===", flush=True)
+    print("=== Complete ===", flush=True)
     print(f"✅ Scores written:     {updated}", flush=True)
     print(f"⏭️  Already correct:   {already_correct}", flush=True)
     print(f"🧹 Bad scores cleared: {cleared}", flush=True)
