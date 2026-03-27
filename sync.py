@@ -27,11 +27,6 @@ INVALID_TITLE_KEYWORDS = [
     "quick discovery",
     "discovery call",
     "setter",
-    "follow-up",
-    "follow up",
-    "rescheduled",
-    "reschedule",
-    "next steps",
 ]
 
 # ─── CLOSE API SESSION ────────────────────────────────────────────────────────
