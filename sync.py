@@ -67,6 +67,28 @@ def close_put(endpoint, data):
         return resp.json()
     resp.raise_for_status()
 
+def close_post(endpoint, data):
+    time.sleep(0.5)
+    url = f"https://api.close.com/api/v1/{endpoint}"
+    for attempt in range(5):
+        resp = session.post(url, json=data, timeout=60)
+        if resp.status_code == 429:
+            wait = float(resp.headers.get("Retry-After", 5))
+            print(f"  Rate limited. Waiting {wait}s...", flush=True)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()
+
+def get_call_summary(attrs):
+    """Extract the Call Summary value from extractedIntelligence."""
+    intelligence = attrs.get("extractedIntelligence") or {}
+    for item in intelligence.values():
+        if item.get("title", "").strip().lower() == "call summary":
+            return item.get("value")
+    return None
+
 # ─── ATTENTION API ────────────────────────────────────────────────────────────
 def get_attention_calls():
     """Fetch recent scored calls from Attention, filtered to sales call types."""
@@ -87,14 +109,6 @@ def get_attention_calls():
     calls = resp.json().get("data", [])
     print(f"  Total calls returned: {len(calls)}", flush=True)
 
-    # DEBUG: dump extractedIntelligence in full
-    if calls:
-        attrs_debug = calls[0].get("attributes", {})
-        print(f"\n=== DEBUG EXTRACTED INTELLIGENCE ===", flush=True)
-        import json as _json
-        print(_json.dumps(attrs_debug.get("extractedIntelligence"), indent=2), flush=True)
-        print(f"=== END DEBUG ===\n", flush=True)
-
     valid = []
     for call in calls:
         attrs = call.get("attributes", {})
@@ -114,10 +128,13 @@ def get_attention_calls():
             print(f"  Skip (no external email): {title}", flush=True)
             continue
 
+        call_summary = get_call_summary(attrs)
+
         valid.append({
             "title": title,
             "score": score,
             "prospect_email": prospect_email,
+            "call_summary": call_summary,
         })
         print(f"  ✅ Valid call: \"{title}\" | {prospect_email} | score={score}", flush=True)
 
@@ -321,6 +338,17 @@ def main():
             close_put(f"lead/{lead_id}/", {QA_FIELD_ID: call["score"]})
             print(f"  ✅ Updated \"{lead_name}\": {existing_score} → {call['score']}", flush=True)
             updated += 1
+
+            # Create note with call summary if available
+            if call.get("call_summary"):
+                note_body = f"📋 Attention Call Summary\n\n{call['call_summary']}"
+                close_post("activity/note/", {
+                    "lead_id": lead_id,
+                    "note": note_body,
+                })
+                print(f"  📝 Note created for \"{lead_name}\"", flush=True)
+            else:
+                print(f"  ⚠️  No call summary available for \"{lead_name}\"", flush=True)
 
         except Exception as e:
             print(f"  ❌ Error: {e}", flush=True)
