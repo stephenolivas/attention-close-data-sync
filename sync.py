@@ -18,7 +18,7 @@ CLOSE_API_KEY     = os.environ["CLOSE_API_KEY"]
 
 INTERNAL_DOMAIN   = "@modern-amenities.com"
 QA_FIELD_ID       = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
-LOOKBACK_HOURS    = 2
+LOOKBACK_HOURS    = 8
 PACIFIC           = ZoneInfo("America/Los_Angeles")
 
 # Match any title containing "vendingpren" (catches all Calendly spelling variants)
@@ -233,7 +233,7 @@ def find_close_lead(attention_call, close_meetings, lead_cache):
 
         # Fetch lead contacts (cached)
         if lead_id not in lead_cache:
-            lead_data = close_get(f"lead/{lead_id}", params={"_fields": "id,display_name,contacts"})
+            lead_data = close_get(f"lead/{lead_id}", params={"_fields": f"id,display_name,contacts,{QA_FIELD_ID}"})
             lead_cache[lead_id] = lead_data
 
         lead = lead_cache[lead_id]
@@ -251,7 +251,7 @@ def find_close_lead(attention_call, close_meetings, lead_cache):
         lead_id = title_matches[0].get("lead_id")
         if lead_id:
             if lead_id not in lead_cache:
-                lead_data = close_get(f"lead/{lead_id}", params={"_fields": "id,display_name,contacts"})
+                lead_data = close_get(f"lead/{lead_id}", params={"_fields": f"id,display_name,contacts,{QA_FIELD_ID}"})
                 lead_cache[lead_id] = lead_data
             lead_name = lead_cache[lead_id].get("display_name", "Unknown")
             print(f"  ⚠️  Title-only match (no email confirm): {lead_name}", flush=True)
