@@ -87,12 +87,12 @@ def get_attention_calls():
     calls = resp.json().get("data", [])
     print(f"  Total calls returned: {len(calls)}", flush=True)
 
-    # DEBUG: dump all attribute keys + values from first call
+    # DEBUG: dump extractedIntelligence in full
     if calls:
         attrs_debug = calls[0].get("attributes", {})
-        print(f"\n=== DEBUG ATTRS ===", flush=True)
-        for k, v in attrs_debug.items():
-            print(f"  {k}: {str(v)[:120]}", flush=True)
+        print(f"\n=== DEBUG EXTRACTED INTELLIGENCE ===", flush=True)
+        import json as _json
+        print(_json.dumps(attrs_debug.get("extractedIntelligence"), indent=2), flush=True)
         print(f"=== END DEBUG ===\n", flush=True)
 
     valid = []
