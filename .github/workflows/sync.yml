@@ -24,5 +24,6 @@ jobs:
         env:
           ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
           CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: python3 -u sync.py
