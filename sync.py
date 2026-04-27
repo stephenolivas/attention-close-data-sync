@@ -38,6 +38,12 @@ ALL_CUSTOM_FIELDS = ",".join([
 
 # ─── TIER CONFIG ──────────────────────────────────────────────────────────────
 # T3/T4 are no-show based and handled separately (no Attention call exists)
+TIER_LABELS = {
+    "T1": "T1 - Hot Lead",
+    "T2": "T2 - Warm Lead",
+    "T3": "T3 - Cool Lead",
+    "T4": "T4 - Cold Lead",
+}
 TIER_TOUCHES      = {"T1": 5, "T2": 4}
 TIER_WINDOW_HOURS = {"T1": 2, "T2": 4}  # hours after call end for first touch deadline
 
@@ -126,18 +132,18 @@ def classify_objection(doubt_text):
         return "other"
     prompt = (
         f"Classify the primary sales objection in the following text into EXACTLY one of these four categories: "
-        f"timing, investment, fit, other.\n\n"
+        f"Timing, Investment, Fit, Other.\n\n"
         f"Respond with only the single word category, nothing else.\n\n"
         f"Text:\n{doubt_text[:1500]}"
     )
     try:
-        result = claude_complete(prompt).lower().strip()
-        if result in ("timing", "investment", "fit", "other"):
+        result = claude_complete(prompt).strip().capitalize()
+        if result in ("Timing", "Investment", "Fit", "Other"):
             return result
-        return "other"
+        return "Other"
     except Exception as e:
         print(f"  ⚠️  Objection classification failed: {e}", flush=True)
-        return "other"
+        return "Other"
 
 def generate_key_concern(doubt_text):
     """Summarize the prospect's main concern in 20 words or fewer."""
@@ -425,7 +431,7 @@ def main():
             update_payload = {
                 QA_FIELD_ID:             call["score"],
                 CALL_LINK_FIELD_ID:      call["call_link"],
-                ATTENTION_TIER_ID:       call["tier"],
+                ATTENTION_TIER_ID:       TIER_LABELS.get(call["tier"]) if call["tier"] else None,
                 MAX_FOLLOWUP_ID:         call["max_followup"],
                 FIRST_TOUCH_DEADLINE_ID: call["first_touch_deadline"],
                 PRIMARY_OBJECTION_ID:    call["primary_objection"],
@@ -434,7 +440,20 @@ def main():
             # Strip None values
             update_payload = {k: v for k, v in update_payload.items() if v is not None}
 
-            close_put(f"lead/{lead_id}/", update_payload)
+            # Try full payload; if 400, fall back field-by-field to find the culprit
+            try:
+                close_put(f"lead/{lead_id}/", update_payload)
+            except Exception as put_err:
+                if "400" in str(put_err):
+                    print(f"  ⚠️  Full payload rejected (400) — trying fields individually...", flush=True)
+                    for field_id, value in update_payload.items():
+                        try:
+                            close_put(f"lead/{lead_id}/", {field_id: value})
+                            print(f"    ✅ {field_id[:40]} = {str(value)[:40]}", flush=True)
+                        except Exception as fe:
+                            print(f"    ❌ FAILED: {field_id[:40]} = {str(value)[:40]} → {fe}", flush=True)
+                else:
+                    raise
             print(f"  ✅ Updated \"{lead_name}\": score={call['score']} | tier={call['tier']} | objection={call['primary_objection']}", flush=True)
             updated += 1
 
