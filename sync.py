@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Attention → Close QA Score Sync
-Matches Attention calls to Close meetings by title + email, then writes QA scores.
+Matches Attention calls to Close meetings by title + email, then writes QA scores,
+call summary notes, and enrichment fields (tier, objection, key concern, call link, etc.)
 """
 
 import os
@@ -15,14 +16,32 @@ from zoneinfo import ZoneInfo
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 ATTENTION_API_KEY = os.environ["ATTENTION_API_KEY"]
 CLOSE_API_KEY     = os.environ["CLOSE_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 INTERNAL_DOMAIN   = "@modern-amenities.com"
-QA_FIELD_ID       = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
 LOOKBACK_HOURS    = 8
 PACIFIC           = ZoneInfo("America/Los_Angeles")
 
-# Match any title containing "vendingpren" (catches all Calendly spelling variants)
-# and excluding setter/discovery calls
+# ─── CLOSE CUSTOM FIELD IDs ───────────────────────────────────────────────────
+QA_FIELD_ID             = "custom.cf_kgYoaN7yLuoTTPQVd1xZsjFsfiyc76fpyjoryJ7ZJHq"
+CALL_LINK_FIELD_ID      = "custom.cf_8fvkyAPLWZpKP0QGhcaqOYoAGGgJIy9aik26d6dY6ew"
+PRIMARY_OBJECTION_ID    = "custom.cf_0oluAzEnKTCyMq55081ImESQBQY0uV6cnzZ0dFXdzgd"
+KEY_CONCERN_ID          = "custom.cf_PPLSuz3PLKU8UB8czoLZYqeLGrFPE4uagM775nqdYgs"
+ATTENTION_TIER_ID       = "custom.cf_qXoHdvbXLY0z8yZAofXheebmmNU0jpkqRJgCIYShxKX"
+MAX_FOLLOWUP_ID         = "custom.cf_AqnJ9rNNdbSKNdIxXyJOCooaH7sPaSCjR89uUXMDzzG"
+FIRST_TOUCH_DEADLINE_ID = "custom.cf_dzy8y9kY3V9xR1sygLb1cJkaKY8qvx3OT6QbB5IsiCA"
+
+ALL_CUSTOM_FIELDS = ",".join([
+    QA_FIELD_ID, CALL_LINK_FIELD_ID, PRIMARY_OBJECTION_ID,
+    KEY_CONCERN_ID, ATTENTION_TIER_ID, MAX_FOLLOWUP_ID, FIRST_TOUCH_DEADLINE_ID,
+])
+
+# ─── TIER CONFIG ──────────────────────────────────────────────────────────────
+# T3/T4 are no-show based and handled separately (no Attention call exists)
+TIER_TOUCHES      = {"T1": 5, "T2": 4}
+TIER_WINDOW_HOURS = {"T1": 2, "T2": 4}  # hours after call end for first touch deadline
+
+# ─── TITLE EXCLUSIONS ─────────────────────────────────────────────────────────
 INVALID_TITLE_KEYWORDS = [
     "quick discovery",
     "discovery call",
@@ -81,13 +100,102 @@ def close_post(endpoint, data):
         return resp.json()
     resp.raise_for_status()
 
-def get_call_summary(attrs):
-    """Extract the Call Summary value from extractedIntelligence."""
+# ─── ANTHROPIC API ────────────────────────────────────────────────────────────
+def claude_complete(prompt):
+    """Single-turn Claude call. Returns text response."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"].strip()
+
+def classify_objection(doubt_text):
+    """Classify the primary objection into one of: timing, investment, fit, other."""
+    if not doubt_text:
+        return "other"
+    prompt = (
+        f"Classify the primary sales objection in the following text into EXACTLY one of these four categories: "
+        f"timing, investment, fit, other.\n\n"
+        f"Respond with only the single word category, nothing else.\n\n"
+        f"Text:\n{doubt_text[:1500]}"
+    )
+    try:
+        result = claude_complete(prompt).lower().strip()
+        if result in ("timing", "investment", "fit", "other"):
+            return result
+        return "other"
+    except Exception as e:
+        print(f"  ⚠️  Objection classification failed: {e}", flush=True)
+        return "other"
+
+def generate_key_concern(doubt_text):
+    """Summarize the prospect's main concern in 20 words or fewer."""
+    if not doubt_text:
+        return None
+    prompt = (
+        f"Summarize the prospect's single biggest concern from the following text in 20 words or fewer. "
+        f"Be direct and specific. No preamble.\n\n"
+        f"Text:\n{doubt_text[:1500]}"
+    )
+    try:
+        return claude_complete(prompt)
+    except Exception as e:
+        print(f"  ⚠️  Key concern generation failed: {e}", flush=True)
+        return None
+
+# ─── ATTENTION DATA EXTRACTION ────────────────────────────────────────────────
+def get_extracted_field(attrs, field_title):
+    """Pull a value from extractedIntelligence by title (case-insensitive)."""
     intelligence = attrs.get("extractedIntelligence") or {}
     for item in intelligence.values():
-        if item.get("title", "").strip().lower() == "call summary":
+        if item.get("title", "").strip().lower() == field_title.lower():
             return item.get("value")
     return None
+
+def get_call_summary(attrs):
+    return get_extracted_field(attrs, "call summary")
+
+def get_doubt_text(attrs):
+    return get_extracted_field(attrs, "doubt")
+
+def get_prospect_email(participants):
+    for p in participants or []:
+        email = (p.get("email") or "").lower()
+        if email and INTERNAL_DOMAIN not in email:
+            return email
+    return None
+
+def get_tier(attendance, score):
+    """Determine T1/T2 based on attendance label and score. T3/T4 handled separately."""
+    if attendance != "Shown":
+        return None
+    if score >= 80:
+        return "T1"
+    if score >= 40:
+        return "T2"
+    return "T2"  # attended but very low score still gets T2
+
+def get_first_touch_deadline(finished_at_str, tier):
+    """Calculate first touch deadline: call end time + tier window."""
+    if not finished_at_str or not tier or tier not in TIER_WINDOW_HOURS:
+        return None
+    try:
+        finished = datetime.fromisoformat(finished_at_str.replace("Z", "+00:00"))
+        deadline = finished + timedelta(hours=TIER_WINDOW_HOURS[tier])
+        return deadline.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
 
 # ─── ATTENTION API ────────────────────────────────────────────────────────────
 def get_attention_calls():
@@ -128,25 +236,42 @@ def get_attention_calls():
             print(f"  Skip (no external email): {title}", flush=True)
             continue
 
-        call_summary = get_call_summary(attrs)
+        # Extract attendance label
+        labels = attrs.get("labels") or {}
+        attendance = labels.get("Attendance", "")
+
+        # Tier + derived fields
+        tier = get_tier(attendance, score)
+        finished_at = attrs.get("finishedAt")
+        call_uuid = attrs.get("uuid") or call.get("id", "")
+        call_link = f"https://app.attention.tech/conversations/all-calls/{call_uuid}" if call_uuid else None
+        first_touch_deadline = get_first_touch_deadline(finished_at, tier)
+
+        # AI-enriched fields from Doubt
+        doubt_text = get_doubt_text(attrs)
+        print(f"  🤖 Classifying objection + key concern for: {title[:60]}...", flush=True)
+        primary_objection = classify_objection(doubt_text)
+        key_concern = generate_key_concern(doubt_text)
 
         valid.append({
             "title": title,
             "score": score,
             "prospect_email": prospect_email,
-            "call_summary": call_summary,
+            "call_summary": get_call_summary(attrs),
+            "call_link": call_link,
+            "tier": tier,
+            "max_followup": TIER_TOUCHES.get(tier),
+            "first_touch_deadline": first_touch_deadline,
+            "primary_objection": primary_objection,
+            "key_concern": key_concern,
         })
-        print(f"  ✅ Valid call: \"{title}\" | {prospect_email} | score={score}", flush=True)
+        print(f"  ✅ Valid call: \"{title}\" | score={score} | tier={tier} | objection={primary_objection}", flush=True)
 
     print(f"\n{len(valid)} valid Attention calls to process.", flush=True)
     return valid
 
 # ─── CLOSE MEETINGS ───────────────────────────────────────────────────────────
 def get_all_close_meetings():
-    """
-    Paginate ALL Close meetings. Date filters are silently ignored by the API
-    so we fetch everything and filter in Python.
-    """
     print("\nFetching all Close meetings (paginating)...", flush=True)
     meetings = []
     skip = 0
@@ -172,7 +297,6 @@ def get_all_close_meetings():
     return meetings
 
 def filter_recent_meetings(meetings, hours=LOOKBACK_HOURS):
-    """Filter meetings to those within the lookback window, converting UTC → Pacific."""
     cutoff = datetime.now(PACIFIC) - timedelta(hours=hours)
     recent = []
 
@@ -201,58 +325,30 @@ def is_valid_title(title):
         return False
     return True
 
-def get_prospect_email(participants):
-    for p in participants or []:
-        email = (p.get("email") or "").lower()
-        if email and INTERNAL_DOMAIN not in email:
-            return email
-    return None
-
 def titles_match(attention_title, close_title):
-    """
-    Check if two meeting titles refer to the same meeting.
-    Strategy: extract the prospect name portion (before 'and Vending')
-    and check if it appears in the other title.
-    """
     if not attention_title or not close_title:
         return False
-
     a = attention_title.lower()
     c = close_title.lower()
-
-    # Direct match
     if a == c:
         return True
-
-    # Extract name from Attention title (everything before ' and vending')
     name_part = None
     for separator in [" and vending", " and vendingprenu", "and vendingpren"]:
         if separator in a:
             name_part = a.split(separator)[0].strip()
             break
-
     if name_part and len(name_part) > 3:
-        # Check if the name appears in the Close title
         if name_part in c:
             return True
-        # Try individual name parts (first + last at minimum)
         parts = [p for p in name_part.split() if len(p) >= 3]
-        matches = sum(1 for p in parts if p in c)
-        if matches >= 2:
+        if sum(1 for p in parts if p in c) >= 2:
             return True
-
     return False
 
 def find_close_lead(attention_call, close_meetings, lead_cache):
-    """
-    Find the Close lead_id for an Attention call by:
-    1. Matching meeting title
-    2. Verifying prospect email matches a contact on that lead
-    """
     prospect_email = attention_call["prospect_email"]
     attn_title = attention_call["title"]
 
-    # Find Close meetings with matching title
     title_matches = [m for m in close_meetings if titles_match(attn_title, m.get("title", ""))]
     print(f"  Title matches in Close: {len(title_matches)}", flush=True)
 
@@ -260,28 +356,26 @@ def find_close_lead(attention_call, close_meetings, lead_cache):
         lead_id = meeting.get("lead_id")
         if not lead_id:
             continue
-
-        # Fetch lead contacts (cached)
         if lead_id not in lead_cache:
-            lead_data = close_get(f"lead/{lead_id}", params={"_fields": f"id,display_name,contacts,{QA_FIELD_ID}"})
+            lead_data = close_get(f"lead/{lead_id}", params={
+                "_fields": f"id,display_name,contacts,{ALL_CUSTOM_FIELDS}"
+            })
             lead_cache[lead_id] = lead_data
-
         lead = lead_cache[lead_id]
         lead_name = lead.get("display_name", "Unknown")
-
-        # Check if prospect email matches any contact on this lead
         for contact in lead.get("contacts", []):
             for email_obj in contact.get("emails", []):
                 if email_obj.get("email", "").lower() == prospect_email:
                     print(f"  ✅ Matched lead: {lead_name} (email + title)", flush=True)
                     return lead_id, lead_name
 
-    # Fallback: title match only (no email confirmation)
     if title_matches:
         lead_id = title_matches[0].get("lead_id")
         if lead_id:
             if lead_id not in lead_cache:
-                lead_data = close_get(f"lead/{lead_id}", params={"_fields": f"id,display_name,contacts,{QA_FIELD_ID}"})
+                lead_data = close_get(f"lead/{lead_id}", params={
+                    "_fields": f"id,display_name,contacts,{ALL_CUSTOM_FIELDS}"
+                })
                 lead_cache[lead_id] = lead_data
             lead_name = lead_cache[lead_id].get("display_name", "Unknown")
             print(f"  ⚠️  Title-only match (no email confirm): {lead_name}", flush=True)
@@ -294,13 +388,11 @@ def main():
     print("=== Attention → Close QA Sync ===", flush=True)
     print(f"Lookback: {LOOKBACK_HOURS} hours | {datetime.now(PACIFIC).strftime('%Y-%m-%d %H:%M %Z')}", flush=True)
 
-    # Step 1: Get valid Attention calls
     attention_calls = get_attention_calls()
     if not attention_calls:
         print("\nNo valid Attention calls to process. Done.", flush=True)
         return
 
-    # Step 2: Get all Close meetings and filter to recent
     all_meetings = get_all_close_meetings()
     recent_meetings = filter_recent_meetings(all_meetings)
 
@@ -308,7 +400,6 @@ def main():
         print("\nNo recent Close meetings found in lookback window. Done.", flush=True)
         return
 
-    # Step 3: Match and update
     lead_cache = {}
     updated = 0
     skipped = 0
@@ -316,7 +407,7 @@ def main():
 
     for call in attention_calls:
         print(f"\nProcessing: \"{call['title']}\"", flush=True)
-        print(f"  Email: {call['prospect_email']} | Score: {call['score']}", flush=True)
+        print(f"  Email: {call['prospect_email']} | Score: {call['score']} | Tier: {call['tier']}", flush=True)
 
         try:
             lead_id, lead_name = find_close_lead(call, recent_meetings, lead_cache)
@@ -326,28 +417,33 @@ def main():
                 skipped += 1
                 continue
 
-            # Check existing score to avoid unnecessary writes
             lead = lead_cache.get(lead_id, {})
             existing_score = lead.get(QA_FIELD_ID)
-            if existing_score == call["score"]:
-                print(f"  ⏭️  Score already up to date ({existing_score}) — skipping", flush=True)
-                skipped += 1
-                continue
+            score_changed = existing_score != call["score"]
 
-            # Write QA score to Close
-            close_put(f"lead/{lead_id}/", {QA_FIELD_ID: call["score"]})
-            print(f"  ✅ Updated \"{lead_name}\": {existing_score} → {call['score']}", flush=True)
+            # Always write all fields on every match
+            update_payload = {
+                QA_FIELD_ID:             call["score"],
+                CALL_LINK_FIELD_ID:      call["call_link"],
+                ATTENTION_TIER_ID:       call["tier"],
+                MAX_FOLLOWUP_ID:         call["max_followup"],
+                FIRST_TOUCH_DEADLINE_ID: call["first_touch_deadline"],
+                PRIMARY_OBJECTION_ID:    call["primary_objection"],
+                KEY_CONCERN_ID:          call["key_concern"],
+            }
+            # Strip None values
+            update_payload = {k: v for k, v in update_payload.items() if v is not None}
+
+            close_put(f"lead/{lead_id}/", update_payload)
+            print(f"  ✅ Updated \"{lead_name}\": score={call['score']} | tier={call['tier']} | objection={call['primary_objection']}", flush=True)
             updated += 1
 
-            # Create note with call summary if available
-            if call.get("call_summary"):
+            # Only create note when score is new (avoid duplicate notes on re-runs)
+            if score_changed and call.get("call_summary"):
                 note_body = f"📋 Attention Call Summary\n\n{call['call_summary']}"
-                close_post("activity/note/", {
-                    "lead_id": lead_id,
-                    "note": note_body,
-                })
+                close_post("activity/note/", {"lead_id": lead_id, "note": note_body})
                 print(f"  📝 Note created for \"{lead_name}\"", flush=True)
-            else:
+            elif score_changed:
                 print(f"  ⚠️  No call summary available for \"{lead_name}\"", flush=True)
 
         except Exception as e:
