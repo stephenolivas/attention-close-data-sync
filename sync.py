@@ -30,10 +30,13 @@ KEY_CONCERN_ID          = "custom.cf_PPLSuz3PLKU8UB8czoLZYqeLGrFPE4uagM775nqdYgs
 ATTENTION_TIER_ID       = "custom.cf_qXoHdvbXLY0z8yZAofXheebmmNU0jpkqRJgCIYShxKX"
 MAX_FOLLOWUP_ID         = "custom.cf_AqnJ9rNNdbSKNdIxXyJOCooaH7sPaSCjR89uUXMDzzG"
 FIRST_TOUCH_DEADLINE_ID = "custom.cf_dzy8y9kY3V9xR1sygLb1cJkaKY8qvx3OT6QbB5IsiCA"
+CALL_ID_FIELD_ID        = "custom.cf_o3rG6LXcHDGiX6x0j1ISjuytGrqM5UribVPhJMLRWbD"
+MEETING_TITLE_FIELD_ID  = "custom.cf_IHSgCE1S61fMOF5kuHRS07oG7ZqfJitRaKXIYusRm5r"
 
 ALL_CUSTOM_FIELDS = ",".join([
     QA_FIELD_ID, CALL_LINK_FIELD_ID, PRIMARY_OBJECTION_ID,
     KEY_CONCERN_ID, ATTENTION_TIER_ID, MAX_FOLLOWUP_ID, FIRST_TOUCH_DEADLINE_ID,
+    CALL_ID_FIELD_ID, MEETING_TITLE_FIELD_ID,
 ])
 
 # ─── TIER CONFIG ──────────────────────────────────────────────────────────────
@@ -261,6 +264,8 @@ def get_attention_calls():
 
         valid.append({
             "title": title,
+            "clean_title": clean_title(title),
+            "call_id": call_uuid,
             "score": score,
             "prospect_email": prospect_email,
             "call_summary": get_call_summary(attrs),
@@ -321,10 +326,19 @@ def filter_recent_meetings(meetings, hours=LOOKBACK_HOURS):
     return recent
 
 # ─── MATCHING ─────────────────────────────────────────────────────────────────
+import re as _re
+
+def clean_title(title):
+    """Strip recording upload suffixes e.g. ' - 2026_04_23 13_26 PDT - Recording.mp4'"""
+    if not title:
+        return title
+    cleaned = _re.sub(r'\s*-\s*\d{4}[_\-]\d{2}[_\-]\d{2}[\s_]\d{2}[_\-]\d{2}.*$', '', title).strip()
+    return cleaned
+
 def is_valid_title(title):
     if not title:
         return False
-    lower = title.lower()
+    lower = clean_title(title).lower()
     if "vendingpren" not in lower:
         return False
     if any(kw in lower for kw in INVALID_TITLE_KEYWORDS):
@@ -334,7 +348,7 @@ def is_valid_title(title):
 def titles_match(attention_title, close_title):
     if not attention_title or not close_title:
         return False
-    a = attention_title.lower()
+    a = clean_title(attention_title).lower()
     c = close_title.lower()
     if a == c:
         return True
@@ -436,6 +450,8 @@ def main():
                 FIRST_TOUCH_DEADLINE_ID: call["first_touch_deadline"],
                 PRIMARY_OBJECTION_ID:    call["primary_objection"],
                 KEY_CONCERN_ID:          call["key_concern"],
+                CALL_ID_FIELD_ID:        call["call_id"],
+                MEETING_TITLE_FIELD_ID:  call["clean_title"],
             }
             # Strip None values
             update_payload = {k: v for k, v in update_payload.items() if v is not None}
