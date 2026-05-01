@@ -361,8 +361,7 @@ def main():
         if not is_valid_title(title) or score is None:
             continue
         prospect_email = get_prospect_email(attrs.get("participants", []))
-        if not prospect_email:
-            continue
+        # Note: recording uploads may have no prospect email — still include them for title-only matching
 
         labels = attrs.get("labels") or {}
         attendance = labels.get("Attendance", "")
@@ -417,7 +416,7 @@ def main():
         for acall in scored_calls:
             for close_title in mtitles:
                 if titles_match(acall["title"], close_title):
-                    if acall["prospect_email"] in lead_emails:
+                    if acall["prospect_email"] and acall["prospect_email"] in lead_emails:
                         best_match = acall
                         break
                     elif fallback_match is None:
