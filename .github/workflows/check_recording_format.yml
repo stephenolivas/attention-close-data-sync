@@ -1,0 +1,27 @@
+name: Check Close Recording Format (Diagnostic)
+
+on:
+  workflow_dispatch: # Manual trigger only
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check Recording Format
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 -u check_recording_format.py
