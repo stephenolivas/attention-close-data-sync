@@ -55,6 +55,11 @@ content_length = len(dl.content)
 magic_bytes = dl.content[:16].hex()
 first_bytes_raw = dl.content[:4]
 
+# Save to disk for artifact upload
+with open("recording.mp3", "wb") as f:
+    f.write(dl.content)
+print(f"Saved to recording.mp3", flush=True)
+
 print(f"\n=== Results ===", flush=True)
 print(f"HTTP Status:      {dl.status_code}", flush=True)
 print(f"Content-Type:     {content_type}", flush=True)
