@@ -1,0 +1,43 @@
+name: Test Close → Attention Import (Diagnostic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      close_call_id:
+        description: 'Specific Close call ID to test (optional - leave blank to use most recent)'
+        required: false
+        default: ''
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Find Attention User ID
+        env:
+          ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
+        run: |
+          echo "=== Available Attention Users ==="
+          curl -s -H "Authorization: Bearer $ATTENTION_API_KEY" \
+            https://api.attention.tech/v2/users | python3 -m json.tool
+
+      - name: Run Close → Attention Import Test
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
+          ATTENTION_USER_ID: ${{ secrets.ATTENTION_USER_ID }}
+          CLOSE_CALL_ID: ${{ github.event.inputs.close_call_id }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 -u test_close_to_attention.py
