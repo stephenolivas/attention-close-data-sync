@@ -7,15 +7,18 @@ that have a recording_url and duration >= MIN_DURATION, downloads each
 MP3, uploads to Attention via the signed-upload + import pattern, and
 sets applicationExternalID = call.id for idempotency.
 
-Combined with the existing Attention → Close hourly sync, this closes
-the loop:
+Imports Close dialer calls into Attention so they get analyzed
+(transcript, scorecard, extracted intelligence). The imported
+conversation title is intentionally crafted to NOT pass the existing
+Attention → Close reverse sync's is_valid_title() filter (i.e. it does
+not contain "vendingpren"). This means dialer call analyses do NOT
+overwrite the lead's standard Attention fields, which are reserved for
+the official video call's analysis.
 
-  Close dialer call
-    → import to Attention (this script)
-    → Attention runs scorecard + extracted intelligence
-    → existing Attention → Close sync picks it up next hour
-    → writes QA Score, Tier, Primary Objection, Key Concern, Call
-      Summary back to the Close lead
+Dialer call analyses are intended to land on the matched Close lead as
+their own Close Custom Activity instances (separate timeline entries,
+not lead fields). The Custom Activity enrichment path is built as a
+follow-up sync; see project context doc for status.
 
 Idempotency: before importing, we check Attention for an existing
 conversation with applicationExternalID == call.id (via Attention's
@@ -50,8 +53,15 @@ CLOSE_API_BASE = "https://api.close.com/api/v1"
 ATTENTION_API_BASE = "https://api.attention.tech/v2"
 
 APPLICATION_NAME = "close"
-TITLE_TEMPLATE = "{lead_name} - Vendingpreneurs Close Dialer Call"
-FALLBACK_TITLE_TEMPLATE = "Vendingpreneurs Close Dialer Call {call_id}"
+
+# Title intentionally does NOT contain "vendingpren" — this causes the
+# existing Attention → Close reverse sync's is_valid_title() filter to
+# skip these conversations, so dialer call analyses do not overwrite the
+# lead's video-call Attention fields. A separate Custom Activity sync
+# will pick these up via applicationName == "close" and write each one
+# as its own activity instance on the matched lead.
+TITLE_TEMPLATE = "{lead_name} - Close Dialer Call"
+FALLBACK_TITLE_TEMPLATE = "Close Dialer Call {call_id}"
 
 CLOSE_REQUEST_DELAY = 0.5  # match existing reverse sync's pacing
 
@@ -265,7 +275,9 @@ def import_call(call, user_map, user_email_cache):
 
     log(f"Owner: {user_email} → {attention_user_uuid}", indent=1)
 
-    # Build title (must pass the existing reverse sync's is_valid_title filter)
+    # Build title — note we deliberately omit "vendingpren" so the
+    # existing reverse sync's is_valid_title filter SKIPS this conversation
+    # (see module docstring + TITLE_TEMPLATE comment for why)
     lead_name = close_get_lead_name(call.get("lead_id"))
     if lead_name:
         title = TITLE_TEMPLATE.format(lead_name=lead_name)
