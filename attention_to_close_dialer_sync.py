@@ -2,35 +2,37 @@
 """
 Attention → Close dialer call enrichment.
 
-Reads recent Attention conversations with applicationName == "close"
-(i.e. imported by close_to_attention_sync.py) and writes their analysis
-to the matched Close lead as a Custom Activity instance.
+For each recent Close dialer call (recording_url + duration ≥ MIN_DURATION):
+  1. Look up its Attention conversation by external_id (= Close call activity ID)
+  2. If found and fully processed (scorecard + extracted intelligence ready),
+     create a Custom Activity instance on the matched Close lead with all
+     analysis fields populated.
 
-Why a separate sync from the existing Attention → Close reverse sync:
-the existing sync writes to lead-level Attention fields that are
-reserved for the official video call analysis. Dialer call analyses
-land here instead as their own first-class Custom Activity entries on
-the lead timeline, so they don't compete with or overwrite the video
-call's fields.
+Why drive the loop from the Close side rather than Attention:
+Attention's API stores applicationName / applicationExternalID on imported
+conversations but does NOT return them in either the list or GET response
+shapes (verified empirically). The only reliable way to use those IDs is
+to look up a conversation BY external_id (which works) — i.e. we iterate
+Close call IDs and ask Attention "do you have a conversation for this one?"
+rather than the reverse.
 
-For each eligible conversation:
-  1. Find the matched Close lead via applicationExternalID (Close call
-     activity ID) → activity.call.lead_id
-  2. Check if a Custom Activity for this Attention conversation already
-     exists on the lead (idempotency); skip if so
-  3. Use Claude Haiku to classify Primary Objection and summarize Key
-     Concern from extractedIntelligence.Doubt
-  4. POST a new Custom Activity instance on the lead with all fields
-     populated
+Result: a clean closed loop without depending on undocumented response
+shape from Attention.
+
+Combined with the rest of the integration:
+  :00 - existing Attention → Close sync (video calls → lead fields)
+  :15 - close_to_attention_sync (Close dialer calls → Attention)
+  :30 - this script (Attention dialer analyses → Close Custom Activities)
 
 Required GitHub secrets:
   CLOSE_API_KEY        Close API key (Basic auth)
   ATTENTION_API_KEY    Attention API key (header value, no "Bearer ")
-  ANTHROPIC_API_KEY    Anthropic API key (for Claude Haiku)
+  ANTHROPIC_API_KEY    Anthropic API key (for Claude Haiku enrichment)
 
 Optional env vars:
-  HOURS_BACK           Window of Attention conversations to consider (default: 24)
-  DRY_RUN              If "1", log what would happen but don't write to Close
+  HOURS_BACK           Window of recent Close calls to consider (default: 24)
+  MIN_DURATION         Skip Close calls shorter than this in seconds (default: 180)
+  DRY_RUN              If "1", log payloads without writing to Close
 """
 
 import os
@@ -47,6 +49,7 @@ CLOSE_API_KEY = os.environ["CLOSE_API_KEY"]
 ATTENTION_API_KEY = os.environ["ATTENTION_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "24"))
+MIN_DURATION = int(os.environ.get("MIN_DURATION", "180"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
 CLOSE_API_BASE = "https://api.close.com/api/v1"
@@ -88,12 +91,6 @@ def normalize_field_name(name):
     the first ASCII letter. Close field names are often prefixed with ⚡
     or similar icons for visual grouping; we want to match on the
     semantic name only.
-
-    Examples:
-      "⚡ Attention Call Title"  -> "Attention Call Title"
-      "⚡︎ Attention Call ID"     -> "Attention Call ID"
-      "   QA Score"              -> "QA Score"
-      "QA Score"                 -> "QA Score"
     """
     return re.sub(r"^[^a-zA-Z]+", "", name).strip()
 
@@ -137,6 +134,26 @@ def attention_get(path, params=None):
             continue
         return resp
     raise Exception(f"Attention GET {path} exhausted retries")
+
+
+def attention_get_conversation_by_external_id(external_id):
+    """
+    Look up an Attention conversation by its applicationExternalID (which
+    we set to the Close call activity ID on import). Returns the full
+    attributes dict or None if not found.
+    """
+    resp = attention_get(
+        f"/conversations/{external_id}",
+        params={"by": "external_id"},
+    )
+    if resp.status_code == 404:
+        return None
+    if not resp.ok:
+        log(f"⚠️  Attention by-external-id lookup failed for {external_id}: {resp.status_code}: {resp.text[:200]}", indent=1)
+        return None
+
+    body = resp.json()
+    return body.get("attributes", body)
 
 
 # ===== Anthropic (Claude Haiku) =====
@@ -211,7 +228,6 @@ def find_custom_activity_type():
     for activity_type in data.get("data", []):
         if activity_type.get("name") == CUSTOM_ACTIVITY_TYPE_NAME:
             type_id = activity_type["id"]
-            # Try multiple possible key names for the fields list — defensive
             fields_list = (
                 activity_type.get("fields")
                 or activity_type.get("custom_fields")
@@ -229,7 +245,7 @@ def find_custom_activity_type():
             if not field_ids:
                 log("WARNING: no fields found in Custom Activity Type response.", indent=1)
                 log(f"Top-level keys returned: {list(activity_type.keys())}", indent=1)
-                log(f"Sample (first 2000 chars):", indent=1)
+                log("Sample (first 2000 chars):", indent=1)
                 log(json.dumps(activity_type, indent=2)[:2000], indent=2)
 
             return {"id": type_id, "fields": field_ids}
@@ -240,137 +256,69 @@ def find_custom_activity_type():
     )
 
 
-# ===== Attention conversation fetching =====
-def fetch_eligible_conversations(since_dt):
+# ===== Close call iteration =====
+def find_recent_close_calls(since_dt):
     """
-    Find Attention conversations matching our dialer call title format
-    that are fully processed and have applicationExternalID populated.
-
-    Two-step lookup:
-      1. List conversations with server-side title filter (cheap, narrow).
-      2. For each candidate, fetch full details via GET /conversations/{id}.
-
-    Step 2 is necessary because the list endpoint omits import-specific
-    fields (applicationName, applicationExternalID, full importMetadata)
-    from its response even when those fields exist on the conversation.
-    The GET endpoint returns the full attribute set including those.
-
-    With server-side title filtering, the candidate set per run is small
-    (a handful of dialer calls per day), so the extra GETs are cheap.
+    Iterate Close call activities newer than since_dt with a recording_url
+    and duration >= MIN_DURATION. Newest-first.
     """
-    # Step 1: list candidates by title
-    candidates = []
-    listed_sample_attrs = None
-    page = 1
-    # Attention's fromDateTime requires ISO 8601 with a Z suffix and no
-    # microseconds (the default datetime.isoformat() format is rejected).
-    since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    while True:
-        resp = attention_get(
-            "/conversations",
-            params={
-                "fromDateTime": since_str,
-                "page": page,
-                "size": 50,
-                # Case-insensitive partial title match per Attention docs.
-                "filter[title]": "Close Dialer Call",
-            },
-        )
+    eligible = []
+    inspected = 0
+    skipped_short = 0
+    skipped_no_recording = 0
+    skipped_no_lead = 0
+
+    skip = 0
+    pages = 0
+    max_pages = 200
+    while pages < max_pages:
+        resp = close_get("/activity/call/", params={"_skip": skip, "_limit": 100})
         if not resp.ok:
             raise Exception(
-                f"Could not list Attention conversations: {resp.status_code}: {resp.text[:300]}"
+                f"Close /activity/call/ returned {resp.status_code}: {resp.text[:300]}"
             )
-
-        body = resp.json()
-        items = body.get("data", [])
+        data = resp.json()
+        items = data.get("data", [])
         if not items:
             break
 
-        for item in items:
-            attrs = item.get("attributes", item)
-            if listed_sample_attrs is None:
-                listed_sample_attrs = attrs
-            uuid = attrs.get("uuid") or item.get("id")
-            if uuid:
-                candidates.append({"uuid": uuid, "title": attrs.get("title", "")})
+        window_ended = False
+        for call in items:
+            inspected += 1
 
-        meta = body.get("meta", {})
-        page_count = meta.get("pageCount", 1)
-        if page >= page_count:
+            # Parse date; stop once we're past the window
+            date_str = call.get("date_created", "")
+            try:
+                call_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if call_dt < since_dt:
+                window_ended = True
+                break
+
+            if not call.get("recording_url"):
+                skipped_no_recording += 1
+                continue
+            if (call.get("duration") or 0) < MIN_DURATION:
+                skipped_short += 1
+                continue
+            if not call.get("lead_id"):
+                skipped_no_lead += 1
+                continue
+
+            eligible.append(call)
+
+        if window_ended or not data.get("has_more"):
             break
-        page += 1
+        skip += 100
+        pages += 1
 
-    log(f"Listed {len(candidates)} candidates matching title 'Close Dialer Call' in the window")
-
-    # Step 2: fetch full details for each candidate
-    eligible = []
-    skipped_no_external_id = 0
-    skipped_not_processed = 0
-    fetch_failed = 0
-    full_sample_attrs = None
-
-    for cand in candidates:
-        uuid = cand["uuid"]
-        resp = attention_get(f"/conversations/{uuid}")
-        if not resp.ok:
-            log(f"  ⚠️  Could not fetch full details for {uuid}: {resp.status_code}", indent=1)
-            fetch_failed += 1
-            continue
-
-        body = resp.json()
-        attrs = body.get("attributes", body)
-        if full_sample_attrs is None:
-            full_sample_attrs = attrs
-
-        # Must have applicationExternalID to map back to a Close call → lead
-        if not attrs.get("applicationExternalID"):
-            skipped_no_external_id += 1
-            continue
-
-        # Need scorecard + extracted intelligence both populated for enrichment
-        sc = attrs.get("scorecardResults") or []
-        ei = attrs.get("extractedIntelligence") or {}
-        if not sc or not ei:
-            skipped_not_processed += 1
-            continue
-
-        eligible.append(attrs)
-
-    log(f"  Skipped (no applicationExternalID): {skipped_no_external_id}")
-    log(f"  Skipped (not yet fully processed): {skipped_not_processed}")
-    if fetch_failed:
-        log(f"  Fetch failures:                    {fetch_failed}")
-    log(f"  Eligible:                          {len(eligible)}")
-
-    # Diagnostic when zero eligible
-    if not eligible:
-        log("")
-        if not candidates:
-            log("DEBUG: No conversations matched the title filter 'Close Dialer Call'.", indent=1)
-            log(f"Either there are no dialer imports in the last {HOURS_BACK}h, or the", indent=2)
-            log("title filter isn't behaving as expected. Try increasing HOURS_BACK.", indent=2)
-        elif skipped_no_external_id == len(candidates) - fetch_failed:
-            log("DEBUG: All candidates lacked applicationExternalID, even when fetched in full.", indent=1)
-            log("This is unexpected for conversations imported via close_to_attention_sync.", indent=2)
-            log("Either the imports were created differently, or Attention's GET endpoint", indent=2)
-            log("also omits this field. Inspect a known imported conversation in Attention.", indent=2)
-            if full_sample_attrs:
-                log(f"Sample title: {full_sample_attrs.get('title')!r}", indent=2)
-                log(f"Sample importMetadata: {json.dumps(full_sample_attrs.get('importMetadata') or {}, indent=2)[:500]}", indent=2)
-        else:
-            log("DEBUG: Candidates found but not yet fully processed.", indent=1)
-            log("Try increasing HOURS_BACK or wait for Attention to finish processing.", indent=2)
-
+    log(f"Inspected {inspected} Close calls in the {HOURS_BACK}h window")
+    log(f"  Skipped (no recording):       {skipped_no_recording}")
+    log(f"  Skipped (under {MIN_DURATION}s): {skipped_short}")
+    log(f"  Skipped (no lead_id):         {skipped_no_lead}")
+    log(f"  Eligible:                     {len(eligible)}")
     return eligible
-
-
-# ===== Lead lookup =====
-def get_close_lead_id(call_activity_id):
-    """Look up the Close call activity to find its lead_id."""
-    resp = close_get(f"/activity/call/{call_activity_id}/", params={"_fields": "lead_id"})
-    if not resp.ok:
-        return None
-    return resp.json().get("lead_id")
 
 
 # ===== Idempotency =====
@@ -381,8 +329,7 @@ def custom_activity_already_exists(lead_id, type_id, attention_uuid, attention_c
         params={"lead_id": lead_id, "custom_activity_type_id": type_id},
     )
     if not resp.ok:
-        # Don't block — let the POST attempt either succeed or surface the issue
-        return False
+        return False  # let the POST attempt surface the issue
 
     for activity in resp.json().get("data", []):
         existing = activity.get(f"custom.{attention_call_id_field_id}")
@@ -391,7 +338,7 @@ def custom_activity_already_exists(lead_id, type_id, attention_uuid, attention_c
     return False
 
 
-# ===== Helpers for extracted intelligence =====
+# ===== Extracted intelligence helpers =====
 def get_ei_value(ei_dict, target_title):
     """Find the EI entry whose title matches target_title (case-insensitive, trimmed)."""
     target = target_title.lower().strip()
@@ -404,29 +351,38 @@ def get_ei_value(ei_dict, target_title):
 
 
 # ===== Enrichment =====
-def enrich_conversation(conv, type_info):
-    """Process one Attention conversation. Returns the new Custom Activity ID, or None if skipped."""
-    uuid = conv.get("uuid")
-    title = conv.get("title", "")
-    external_id = conv.get("applicationExternalID")
-    duration = conv.get("mediaDuration", 0) or 0
+def enrich_call(close_call, type_info):
+    """
+    Process one Close call: look up its Attention conversation by external_id,
+    and if processed, create a Custom Activity on the matched lead.
+    Returns the new Custom Activity ID, or None if skipped for any reason.
+    """
+    call_id = close_call["id"]
+    duration = close_call.get("duration") or 0
+    lead_id = close_call.get("lead_id")
 
-    log(f"\n[{uuid}] '{title}'")
-    log(f"  external_id: {external_id}", indent=1)
-    log(f"  duration:    {duration}s", indent=1)
+    log(f"\n[{call_id}] duration={duration}s, lead={lead_id}")
 
-    if not external_id:
-        log("→ No applicationExternalID, skip", indent=1)
+    # 1. Look up Attention conversation by external_id
+    attention_attrs = attention_get_conversation_by_external_id(call_id)
+    if not attention_attrs:
+        log("→ No Attention conversation yet (still importing or never imported), skip", indent=1)
         return None
 
-    # Find the Close lead
-    lead_id = get_close_lead_id(external_id)
-    if not lead_id:
-        log(f"→ Could not find Close lead for activity {external_id}, skip", indent=1)
-        return None
-    log(f"  lead_id:     {lead_id}", indent=1)
+    uuid = attention_attrs.get("uuid")
+    title = attention_attrs.get("title", "")
+    log(f"Attention conversation: {uuid}", indent=1)
+    log(f"Title:                  {title!r}", indent=1)
 
-    # Idempotency
+    # 2. Check processing completeness
+    sc = attention_attrs.get("scorecardResults") or []
+    ei = attention_attrs.get("extractedIntelligence") or {}
+    if not sc or not ei:
+        log("→ Attention analysis not yet complete, skip (will retry next run)", indent=1)
+        log(f"  scorecardResults: {len(sc)}, extractedIntelligence: {len(ei)}", indent=2)
+        return None
+
+    # 3. Idempotency check
     field_ids = type_info["fields"]
     attention_call_id_field_id = field_ids.get("Attention Call ID")
     if not attention_call_id_field_id:
@@ -437,18 +393,16 @@ def enrich_conversation(conv, type_info):
         log("→ Custom Activity already exists for this conversation, skip", indent=1)
         return None
 
-    # Pull analysis fields
-    scorecards = conv.get("scorecardResults") or []
+    # 4. Pull analysis fields
     qa_score = None
-    if scorecards:
-        summary = scorecards[0].get("summary") or {}
+    if sc:
+        summary = sc[0].get("summary") or {}
         qa_score = summary.get("averageScore")
 
-    ei = conv.get("extractedIntelligence") or {}
     doubt_text = get_ei_value(ei, "Doubt")
     call_summary = get_ei_value(ei, "Call Summary")
 
-    # Claude Haiku enrichment
+    # 5. Claude Haiku enrichment
     log("Classifying Primary Objection (Haiku)...", indent=1)
     primary_objection = haiku_classify_objection(doubt_text)
     log(f"→ {primary_objection}", indent=2)
@@ -457,9 +411,8 @@ def enrich_conversation(conv, type_info):
     key_concern = haiku_summarize_concern(doubt_text)
     log(f"→ {key_concern[:120]}", indent=2)
 
-    # Build the Custom Activity payload
+    # 6. Build Custom Activity payload
     attention_link = f"https://app.attention.tech/conversations/{uuid}"
-
     field_mapping = {
         "Attention Call Link": attention_link,
         "Attention Call ID": uuid,
@@ -468,8 +421,8 @@ def enrich_conversation(conv, type_info):
         "Primary Objection": primary_objection,
         "Key Concern": key_concern,
         "Call Summary": call_summary,
-        "Call Duration": duration,
-        "Close Call Activity ID": external_id,
+        "Call Duration": attention_attrs.get("mediaDuration") or duration,
+        "Close Call Activity ID": call_id,
     }
 
     payload = {
@@ -485,8 +438,8 @@ def enrich_conversation(conv, type_info):
         payload[f"custom.{field_ids[name]}"] = value
 
     if DRY_RUN:
-        log(f"DRY_RUN — would POST payload:", indent=1)
-        log(json.dumps(payload, indent=2)[:1000], indent=2)
+        log("DRY_RUN — would POST payload:", indent=1)
+        log(json.dumps(payload, indent=2)[:1500], indent=2)
         return None
 
     resp = close_post("/activity/custom/", payload)
@@ -502,7 +455,7 @@ def enrich_conversation(conv, type_info):
 def main():
     section(
         f"Attention → Close dialer call enrichment "
-        f"(HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN})"
+        f"(HOURS_BACK={HOURS_BACK}, MIN_DURATION={MIN_DURATION}s, DRY_RUN={DRY_RUN})"
     )
 
     # 1. Resolve the Custom Activity Type and its field IDs
@@ -514,25 +467,25 @@ def main():
     for name, field_id in sorted(type_info["fields"].items()):
         log(f"  {name}: {field_id}", indent=1)
 
-    # 2. Fetch eligible Attention conversations
+    # 2. Find eligible recent Close calls
     since_dt = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
-    section(f"Fetching Attention conversations since {since_dt.isoformat()}")
-    conversations = fetch_eligible_conversations(since_dt)
+    section(f"Finding recent Close calls since {since_dt.isoformat()}")
+    close_calls = find_recent_close_calls(since_dt)
 
-    # 3. Enrich each
-    section("Enriching conversations")
+    # 3. For each eligible Close call, look up Attention and enrich
+    section("Enriching matched conversations")
     stats = {"enriched": 0, "skipped": 0, "failed": 0}
 
-    for conv in conversations:
+    for call in close_calls:
         try:
-            activity_id = enrich_conversation(conv, type_info)
+            activity_id = enrich_call(call, type_info)
             if activity_id:
                 stats["enriched"] += 1
             else:
                 stats["skipped"] += 1
         except Exception as e:
             stats["failed"] += 1
-            log(f"❌ Error enriching {conv.get('uuid')}: {e}", indent=1)
+            log(f"❌ Error enriching {call.get('id')}: {e}", indent=1)
 
     section("Done")
     log(f"Enriched: {stats['enriched']}")
