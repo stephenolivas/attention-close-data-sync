@@ -1,0 +1,32 @@
+name: Check Attention Conversation
+
+on:
+  workflow_dispatch:
+    inputs:
+      conversation_uuid:
+        description: 'Attention conversation UUID to check'
+        required: true
+        type: string
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check Attention Conversation
+        env:
+          ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
+          ATTENTION_CONVERSATION_UUID: ${{ inputs.conversation_uuid }}
+        run: python3 -u check_attention_conversation.py
