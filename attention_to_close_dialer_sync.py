@@ -243,21 +243,24 @@ def find_custom_activity_type():
 # ===== Attention conversation fetching =====
 def fetch_eligible_conversations(since_dt):
     """
-    Iterate Attention conversations matching our dialer call title format
-    that are fully processed (scorecard + extracted intelligence ready).
+    Find Attention conversations matching our dialer call title format
+    that are fully processed and have applicationExternalID populated.
 
-    We filter server-side by title rather than applicationName because the
-    list endpoint doesn't reliably surface applicationName in its
-    response (it lives in importMetadata for imported conversations and
-    isn't returned consistently across list shapes). All our dialer
-    imports use the title format "{lead_name} - Close Dialer Call", so a
-    case-insensitive partial title match is precise enough.
+    Two-step lookup:
+      1. List conversations with server-side title filter (cheap, narrow).
+      2. For each candidate, fetch full details via GET /conversations/{id}.
+
+    Step 2 is necessary because the list endpoint omits import-specific
+    fields (applicationName, applicationExternalID, full importMetadata)
+    from its response even when those fields exist on the conversation.
+    The GET endpoint returns the full attribute set including those.
+
+    With server-side title filtering, the candidate set per run is small
+    (a handful of dialer calls per day), so the extra GETs are cheap.
     """
-    eligible = []
-    inspected = 0
-    skipped_not_processed = 0
-    sample_attrs = None
-
+    # Step 1: list candidates by title
+    candidates = []
+    listed_sample_attrs = None
     page = 1
     # Attention's fromDateTime requires ISO 8601 with a Z suffix and no
     # microseconds (the default datetime.isoformat() format is rejected).
@@ -269,9 +272,7 @@ def fetch_eligible_conversations(since_dt):
                 "fromDateTime": since_str,
                 "page": page,
                 "size": 50,
-                # Server-side title filter narrows results to our dialer
-                # imports only. Case-insensitive partial match per the
-                # Attention API docs.
+                # Case-insensitive partial title match per Attention docs.
                 "filter[title]": "Close Dialer Call",
             },
         )
@@ -286,20 +287,12 @@ def fetch_eligible_conversations(since_dt):
             break
 
         for item in items:
-            inspected += 1
             attrs = item.get("attributes", item)
-
-            if sample_attrs is None:
-                sample_attrs = attrs
-
-            # Need scorecard + extracted intelligence both populated for enrichment
-            sc = attrs.get("scorecardResults") or []
-            ei = attrs.get("extractedIntelligence") or {}
-            if not sc or not ei:
-                skipped_not_processed += 1
-                continue
-
-            eligible.append(attrs)
+            if listed_sample_attrs is None:
+                listed_sample_attrs = attrs
+            uuid = attrs.get("uuid") or item.get("id")
+            if uuid:
+                candidates.append({"uuid": uuid, "title": attrs.get("title", "")})
 
         meta = body.get("meta", {})
         page_count = meta.get("pageCount", 1)
@@ -307,27 +300,66 @@ def fetch_eligible_conversations(since_dt):
             break
         page += 1
 
-    log(f"Inspected {inspected} conversations matching title 'Close Dialer Call' in the window")
-    log(f"  Skipped (not yet fully processed):    {skipped_not_processed}")
-    log(f"  Eligible:                             {len(eligible)}")
+    log(f"Listed {len(candidates)} candidates matching title 'Close Dialer Call' in the window")
 
-    # Always emit diagnostic context when zero eligible
+    # Step 2: fetch full details for each candidate
+    eligible = []
+    skipped_no_external_id = 0
+    skipped_not_processed = 0
+    fetch_failed = 0
+    full_sample_attrs = None
+
+    for cand in candidates:
+        uuid = cand["uuid"]
+        resp = attention_get(f"/conversations/{uuid}")
+        if not resp.ok:
+            log(f"  ⚠️  Could not fetch full details for {uuid}: {resp.status_code}", indent=1)
+            fetch_failed += 1
+            continue
+
+        body = resp.json()
+        attrs = body.get("attributes", body)
+        if full_sample_attrs is None:
+            full_sample_attrs = attrs
+
+        # Must have applicationExternalID to map back to a Close call → lead
+        if not attrs.get("applicationExternalID"):
+            skipped_no_external_id += 1
+            continue
+
+        # Need scorecard + extracted intelligence both populated for enrichment
+        sc = attrs.get("scorecardResults") or []
+        ei = attrs.get("extractedIntelligence") or {}
+        if not sc or not ei:
+            skipped_not_processed += 1
+            continue
+
+        eligible.append(attrs)
+
+    log(f"  Skipped (no applicationExternalID): {skipped_no_external_id}")
+    log(f"  Skipped (not yet fully processed): {skipped_not_processed}")
+    if fetch_failed:
+        log(f"  Fetch failures:                    {fetch_failed}")
+    log(f"  Eligible:                          {len(eligible)}")
+
+    # Diagnostic when zero eligible
     if not eligible:
         log("")
-        if not sample_attrs:
-            log("DEBUG: No 'Close Dialer Call' titled conversations returned at all.", indent=1)
-            log("Possible causes:", indent=1)
-            log(f"- No dialer calls imported in the last {HOURS_BACK} hours", indent=2)
-            log("- Imports use a different title format than 'Close Dialer Call'", indent=2)
-            log("- Server-side title filter not actually working (check raw response)", indent=2)
+        if not candidates:
+            log("DEBUG: No conversations matched the title filter 'Close Dialer Call'.", indent=1)
+            log(f"Either there are no dialer imports in the last {HOURS_BACK}h, or the", indent=2)
+            log("title filter isn't behaving as expected. Try increasing HOURS_BACK.", indent=2)
+        elif skipped_no_external_id == len(candidates) - fetch_failed:
+            log("DEBUG: All candidates lacked applicationExternalID, even when fetched in full.", indent=1)
+            log("This is unexpected for conversations imported via close_to_attention_sync.", indent=2)
+            log("Either the imports were created differently, or Attention's GET endpoint", indent=2)
+            log("also omits this field. Inspect a known imported conversation in Attention.", indent=2)
+            if full_sample_attrs:
+                log(f"Sample title: {full_sample_attrs.get('title')!r}", indent=2)
+                log(f"Sample importMetadata: {json.dumps(full_sample_attrs.get('importMetadata') or {}, indent=2)[:500]}", indent=2)
         else:
-            log("DEBUG: Conversations returned but none fully processed yet.", indent=1)
-            log("Sample conversation attributes:", indent=1)
-            log(f"  Title:           {sample_attrs.get('title')!r}", indent=2)
-            log(f"  scorecardResults: {len(sample_attrs.get('scorecardResults') or [])} entries", indent=2)
-            log(f"  extractedIntelligence: {len(sample_attrs.get('extractedIntelligence') or {})} fields", indent=2)
-            log(f"  importStatus:    {sample_attrs.get('importStatus')!r}", indent=2)
-            log(f"  transcriptStatus: {sample_attrs.get('transcriptStatus')!r}", indent=2)
+            log("DEBUG: Candidates found but not yet fully processed.", indent=1)
+            log("Try increasing HOURS_BACK or wait for Attention to finish processing.", indent=2)
 
     return eligible
 
