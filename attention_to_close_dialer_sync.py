@@ -242,18 +242,25 @@ def find_custom_activity_type():
 
 # ===== Attention conversation fetching =====
 def fetch_eligible_conversations(since_dt):
-    """Iterate Attention conversations newer than since_dt with applicationName=='close' that are fully processed."""
+    """
+    Iterate Attention conversations matching our dialer call title format
+    that are fully processed (scorecard + extracted intelligence ready).
+
+    We filter server-side by title rather than applicationName because the
+    list endpoint doesn't reliably surface applicationName in its
+    response (it lives in importMetadata for imported conversations and
+    isn't returned consistently across list shapes). All our dialer
+    imports use the title format "{lead_name} - Close Dialer Call", so a
+    case-insensitive partial title match is precise enough.
+    """
     eligible = []
     inspected = 0
-    skipped_wrong_app = 0
     skipped_not_processed = 0
-    sample_attrs = None  # captured for diagnostic if we end up with 0 eligible
+    sample_attrs = None
 
     page = 1
     # Attention's fromDateTime requires ISO 8601 with a Z suffix and no
-    # microseconds. e.g. "2026-05-13T19:24:20Z". The default
-    # datetime.isoformat() output uses "+00:00" and includes microseconds,
-    # both of which Attention rejects with a 400.
+    # microseconds (the default datetime.isoformat() format is rejected).
     since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     while True:
         resp = attention_get(
@@ -262,9 +269,10 @@ def fetch_eligible_conversations(since_dt):
                 "fromDateTime": since_str,
                 "page": page,
                 "size": 50,
-                # applicationName for imported conversations lives in
-                # importMetadata and is only returned when this flag is set.
-                "filter[include_import_metadata]": "true",
+                # Server-side title filter narrows results to our dialer
+                # imports only. Case-insensitive partial match per the
+                # Attention API docs.
+                "filter[title]": "Close Dialer Call",
             },
         )
         if not resp.ok:
@@ -281,24 +289,10 @@ def fetch_eligible_conversations(since_dt):
             inspected += 1
             attrs = item.get("attributes", item)
 
-            # Capture the first conversation's structure for diagnostic
-            # logging if we end up with zero eligible matches.
             if sample_attrs is None:
                 sample_attrs = attrs
 
-            # applicationName may appear at the top level of attributes OR
-            # nested under importMetadata, depending on Attention's response
-            # shape for this endpoint. Check both defensively.
-            app_name = (
-                attrs.get("applicationName")
-                or (attrs.get("importMetadata") or {}).get("applicationName")
-                or ""
-            )
-            if app_name.lower() != "close":
-                skipped_wrong_app += 1
-                continue
-
-            # Need scorecard + extracted intelligence both populated
+            # Need scorecard + extracted intelligence both populated for enrichment
             sc = attrs.get("scorecardResults") or []
             ei = attrs.get("extractedIntelligence") or {}
             if not sc or not ei:
@@ -313,26 +307,27 @@ def fetch_eligible_conversations(since_dt):
             break
         page += 1
 
-    log(f"Inspected {inspected} conversations in the window")
-    log(f"  Skipped (applicationName != 'close'): {skipped_wrong_app}")
+    log(f"Inspected {inspected} conversations matching title 'Close Dialer Call' in the window")
     log(f"  Skipped (not yet fully processed):    {skipped_not_processed}")
     log(f"  Eligible:                             {len(eligible)}")
 
-    # If nothing matched, dump the structure of the first conversation
-    # so we can see what the actual response looks like and adjust.
-    if not eligible and sample_attrs:
+    # Always emit diagnostic context when zero eligible
+    if not eligible:
         log("")
-        log("DEBUG: Zero eligible conversations matched. Dumping sample to help diagnose:", indent=1)
-        log(f"Top-level attribute keys: {sorted(sample_attrs.keys())}", indent=2)
-        import_meta = sample_attrs.get("importMetadata")
-        if import_meta:
-            log(f"importMetadata keys: {sorted(import_meta.keys()) if isinstance(import_meta, dict) else type(import_meta).__name__}", indent=2)
-            log(f"importMetadata value: {json.dumps(import_meta, indent=2)[:1000]}", indent=2)
+        if not sample_attrs:
+            log("DEBUG: No 'Close Dialer Call' titled conversations returned at all.", indent=1)
+            log("Possible causes:", indent=1)
+            log(f"- No dialer calls imported in the last {HOURS_BACK} hours", indent=2)
+            log("- Imports use a different title format than 'Close Dialer Call'", indent=2)
+            log("- Server-side title filter not actually working (check raw response)", indent=2)
         else:
-            log("importMetadata: <empty or missing>", indent=2)
-        log(f"applicationName (top-level): {sample_attrs.get('applicationName')!r}", indent=2)
-        log(f"title: {sample_attrs.get('title')!r}", indent=2)
-        log(f"applicationExternalID: {sample_attrs.get('applicationExternalID')!r}", indent=2)
+            log("DEBUG: Conversations returned but none fully processed yet.", indent=1)
+            log("Sample conversation attributes:", indent=1)
+            log(f"  Title:           {sample_attrs.get('title')!r}", indent=2)
+            log(f"  scorecardResults: {len(sample_attrs.get('scorecardResults') or [])} entries", indent=2)
+            log(f"  extractedIntelligence: {len(sample_attrs.get('extractedIntelligence') or {})} fields", indent=2)
+            log(f"  importStatus:    {sample_attrs.get('importStatus')!r}", indent=2)
+            log(f"  transcriptStatus: {sample_attrs.get('transcriptStatus')!r}", indent=2)
 
     return eligible
 
