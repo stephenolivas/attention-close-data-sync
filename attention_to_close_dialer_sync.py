@@ -38,6 +38,7 @@ import sys
 import time
 import json
 import base64
+import re
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -79,6 +80,22 @@ def log(msg, indent=0):
 
 def section(label):
     print(f"\n{'=' * 60}\n{label}\n{'=' * 60}", flush=True)
+
+
+def normalize_field_name(name):
+    """
+    Strip leading decorative characters (emoji icons, whitespace) before
+    the first ASCII letter. Close field names are often prefixed with ⚡
+    or similar icons for visual grouping; we want to match on the
+    semantic name only.
+
+    Examples:
+      "⚡ Attention Call Title"  -> "Attention Call Title"
+      "⚡︎ Attention Call ID"     -> "Attention Call ID"
+      "   QA Score"              -> "QA Score"
+      "QA Score"                 -> "QA Score"
+    """
+    return re.sub(r"^[^a-zA-Z]+", "", name).strip()
 
 
 # ===== Close API =====
@@ -203,7 +220,11 @@ def find_custom_activity_type():
             )
             field_ids = {}
             for field in fields_list:
-                field_ids[field["name"]] = field["id"]
+                raw_name = field.get("name", "")
+                normalized = normalize_field_name(raw_name)
+                if not normalized:
+                    continue
+                field_ids[normalized] = field["id"]
 
             if not field_ids:
                 log("WARNING: no fields found in Custom Activity Type response.", indent=1)
@@ -228,11 +249,16 @@ def fetch_eligible_conversations(since_dt):
     skipped_not_processed = 0
 
     page = 1
+    # Attention's fromDateTime requires ISO 8601 with a Z suffix and no
+    # microseconds. e.g. "2026-05-13T19:24:20Z". The default
+    # datetime.isoformat() output uses "+00:00" and includes microseconds,
+    # both of which Attention rejects with a 400.
+    since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     while True:
         resp = attention_get(
             "/conversations",
             params={
-                "fromDateTime": since_dt.isoformat(),
+                "fromDateTime": since_str,
                 "page": page,
                 "size": 50,
             },
