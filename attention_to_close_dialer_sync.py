@@ -247,6 +247,7 @@ def fetch_eligible_conversations(since_dt):
     inspected = 0
     skipped_wrong_app = 0
     skipped_not_processed = 0
+    sample_attrs = None  # captured for diagnostic if we end up with 0 eligible
 
     page = 1
     # Attention's fromDateTime requires ISO 8601 with a Z suffix and no
@@ -261,6 +262,9 @@ def fetch_eligible_conversations(since_dt):
                 "fromDateTime": since_str,
                 "page": page,
                 "size": 50,
+                # applicationName for imported conversations lives in
+                # importMetadata and is only returned when this flag is set.
+                "filter[include_import_metadata]": "true",
             },
         )
         if not resp.ok:
@@ -277,8 +281,20 @@ def fetch_eligible_conversations(since_dt):
             inspected += 1
             attrs = item.get("attributes", item)
 
-            app_name = (attrs.get("applicationName") or "").lower()
-            if app_name != "close":
+            # Capture the first conversation's structure for diagnostic
+            # logging if we end up with zero eligible matches.
+            if sample_attrs is None:
+                sample_attrs = attrs
+
+            # applicationName may appear at the top level of attributes OR
+            # nested under importMetadata, depending on Attention's response
+            # shape for this endpoint. Check both defensively.
+            app_name = (
+                attrs.get("applicationName")
+                or (attrs.get("importMetadata") or {}).get("applicationName")
+                or ""
+            )
+            if app_name.lower() != "close":
                 skipped_wrong_app += 1
                 continue
 
@@ -301,6 +317,23 @@ def fetch_eligible_conversations(since_dt):
     log(f"  Skipped (applicationName != 'close'): {skipped_wrong_app}")
     log(f"  Skipped (not yet fully processed):    {skipped_not_processed}")
     log(f"  Eligible:                             {len(eligible)}")
+
+    # If nothing matched, dump the structure of the first conversation
+    # so we can see what the actual response looks like and adjust.
+    if not eligible and sample_attrs:
+        log("")
+        log("DEBUG: Zero eligible conversations matched. Dumping sample to help diagnose:", indent=1)
+        log(f"Top-level attribute keys: {sorted(sample_attrs.keys())}", indent=2)
+        import_meta = sample_attrs.get("importMetadata")
+        if import_meta:
+            log(f"importMetadata keys: {sorted(import_meta.keys()) if isinstance(import_meta, dict) else type(import_meta).__name__}", indent=2)
+            log(f"importMetadata value: {json.dumps(import_meta, indent=2)[:1000]}", indent=2)
+        else:
+            log("importMetadata: <empty or missing>", indent=2)
+        log(f"applicationName (top-level): {sample_attrs.get('applicationName')!r}", indent=2)
+        log(f"title: {sample_attrs.get('title')!r}", indent=2)
+        log(f"applicationExternalID: {sample_attrs.get('applicationExternalID')!r}", indent=2)
+
     return eligible
 
 
