@@ -123,7 +123,7 @@ def html_wrap(text):
     if not paragraphs:
         return f"<body><p>{escaped}</p></body>"
     inner = "".join(
-        f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs
+        f"<p>{p.replace(chr(10), '<br/>')}</p>" for p in paragraphs
     )
     return f"<body>{inner}</body>"
 
