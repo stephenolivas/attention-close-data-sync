@@ -1,0 +1,52 @@
+name: Close → Attention Sync
+
+on:
+  schedule:
+    # Hourly at :15, offset from the existing Attention → Close sync at :00
+    # to spread API load across both directions.
+    - cron: '15 * * * *'
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 'Window of recent Close calls to consider, in hours'
+        required: false
+        default: '8'
+      min_duration:
+        description: 'Minimum call duration in seconds (Attention discards short calls)'
+        required: false
+        default: '180'
+      dry_run:
+        description: 'Dry run (1 = log what would happen, do not actually import)'
+        required: false
+        default: '0'
+
+# Prevent overlapping runs (each run takes a few minutes; cron runs hourly)
+concurrency:
+  group: close-to-attention-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run sync
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
+          HOURS_BACK: ${{ inputs.hours_back || '8' }}
+          MIN_DURATION: ${{ inputs.min_duration || '180' }}
+          DRY_RUN: ${{ inputs.dry_run || '0' }}
+        run: python3 -u close_to_attention_sync.py
