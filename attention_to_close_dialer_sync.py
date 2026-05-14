@@ -95,6 +95,34 @@ def normalize_field_name(name):
     return re.sub(r"^[^a-zA-Z]+", "", name).strip()
 
 
+def html_wrap(text):
+    """
+    Wrap plain text in HTML for Close Custom Activity Textarea fields.
+
+    Close's Custom Activity "Textarea" field type is parsed as HTML server-
+    side, not plain text. Sending raw strings produces a 400 with
+    `"Start tag expected, '<' not found"`. This helper:
+      - HTML-escapes special characters (`&`, `<`, `>`) in the source
+      - Splits on blank lines into <p> paragraphs
+      - Preserves single newlines as <br>
+    For empty / None input, returns the input unchanged so the caller's
+    "skip empty values" logic still applies.
+    """
+    if not text:
+        return text
+    escaped = (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    paragraphs = [p for p in escaped.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return f"<p>{escaped}</p>"
+    return "".join(
+        f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs
+    )
+
+
 # ===== Close API =====
 def close_get(path, params=None):
     url = path if path.startswith("http") else f"{CLOSE_API_BASE}{path}"
@@ -412,6 +440,11 @@ def enrich_call(close_call, type_info):
     log(f"→ {key_concern[:120]}", indent=2)
 
     # 6. Build Custom Activity payload
+    # NOTE: Close Custom Activity "Textarea" fields are parsed as HTML
+    # server-side. Key Concern and Call Summary are Textarea-typed and must
+    # be wrapped via html_wrap(); plain strings produce a 400 with
+    # `"Start tag expected, '<' not found"`. The other fields are
+    # Text/Number/Dropdown and take their values as-is.
     attention_link = f"https://app.attention.tech/conversations/{uuid}"
     field_mapping = {
         "Attention Call Link": attention_link,
@@ -419,8 +452,8 @@ def enrich_call(close_call, type_info):
         "Attention Call Title": title,
         "QA Score": qa_score,
         "Primary Objection": primary_objection,
-        "Key Concern": key_concern,
-        "Call Summary": call_summary,
+        "Key Concern": html_wrap(key_concern),
+        "Call Summary": html_wrap(call_summary),
         "Call Duration": attention_attrs.get("mediaDuration") or duration,
         "Close Call Activity ID": call_id,
     }
