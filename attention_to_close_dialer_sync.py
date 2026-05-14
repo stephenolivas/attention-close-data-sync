@@ -100,11 +100,15 @@ def html_wrap(text):
     Wrap plain text in HTML for Close Custom Activity Textarea fields.
 
     Close's Custom Activity "Textarea" field type is parsed as HTML server-
-    side, not plain text. Sending raw strings produces a 400 with
-    `"Start tag expected, '<' not found"`. This helper:
+    side AND specifically requires the value to be wrapped in <body>...</body>
+    tags. Sending raw strings produces a 400 with `"Start tag expected, '<'
+    not found"`; sending bare <p> tags without a <body> wrapper produces
+    `"HTML rich text fields in Close are expected to start with a '<body>'
+    tag and end with '</body>'"`. This helper:
       - HTML-escapes special characters (`&`, `<`, `>`) in the source
       - Splits on blank lines into <p> paragraphs
       - Preserves single newlines as <br>
+      - Wraps the whole thing in <body>...</body>
     For empty / None input, returns the input unchanged so the caller's
     "skip empty values" logic still applies.
     """
@@ -117,10 +121,11 @@ def html_wrap(text):
     )
     paragraphs = [p for p in escaped.split("\n\n") if p.strip()]
     if not paragraphs:
-        return f"<p>{escaped}</p>"
-    return "".join(
+        return f"<body><p>{escaped}</p></body>"
+    inner = "".join(
         f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs
     )
+    return f"<body>{inner}</body>"
 
 
 # ===== Close API =====
