@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-Attention → Close meeting analysis sync (follow-ups, discovery, setter, etc.)
+Attention → Close meeting analysis sync (everything not a first-sale or dialer).
 
-For Attention conversations that:
-  - Are NOT first sales calls (those are handled by sync.py at :00)
-  - Are NOT Close dialer calls (those are handled by
-    attention_to_close_dialer_sync.py at :30)
-  - ARE follow-up / discovery / setter / next-steps / rescheduled meetings
+Captures every analyzed Attention conversation that ISN'T already handled by:
+  - sync.py at :00 (first sales calls — title contains "vendingpren" and
+    lacks any of the follow-up exclusion keywords)
+  - attention_to_close_dialer_sync.py at :30 (title contains "Close Dialer Call")
 
-…we look up the matching Close lead (by prospect email, with a title-only
-name-extraction fallback) and create a Custom Activity of type
-"Attention - Meeting Analysis" with all enrichment fields populated.
+Everything else falls to this sync — follow-ups, discovery calls, setter
+calls, next-steps reviews, generic "Call with X" titles, "X Vending
+Consultation" calls that don't carry the "vendingpren" suffix, etc.
 
-This closes the third sync slot in the hourly schedule:
-  :00 - sync.py                              (video first sales calls → lead fields)
+For each in-scope conversation we look up the matching Close lead (by
+prospect email, with a title-only name-extraction fallback for cases like
+"VP follow up with Sophia") and create a Custom Activity of type
+"Attention - Meeting Analysis" with all enrichment fields populated,
+including a ⚡ Meeting Type classification derived from the title.
+
+This closes the fourth sync slot in the hourly schedule:
+  :00 - sync.py                              (first sales calls → lead fields)
   :15 - close_to_attention_sync.py           (Close dialer recordings → Attention)
   :30 - attention_to_close_dialer_sync.py    (Attention dialer analyses → Close CA)
-  :45 - THIS                                 (Attention follow-ups → Close CA)
+  :45 - THIS                                 (Attention everything-else → Close CA)
 
 Required GitHub secrets:
   CLOSE_API_KEY        Close API key (Basic auth)
@@ -53,21 +58,26 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 INTERNAL_DOMAIN = "@modern-amenities.com"
 
-# Title classification keywords (case-insensitive substring match)
-# These define "what we capture" — anything matching at least one of these
-# (and not a Close dialer call) is in scope. Order doesn't matter here;
-# meeting-type classification has its own priority order below.
-FOLLOWUP_KEYWORDS = (
+# Keywords that disqualify a title from being a "first sales call" in the
+# :00 sync. Mirrors sync.py's INVALID_TITLE_KEYWORDS — keep in sync if
+# sync.py's filter ever changes. Used here to identify which calls the
+# :00 sync handles (so we can EXCLUDE them).
+FIRST_SALE_EXCLUSION_KEYWORDS = (
+    "quick discovery",
+    "discovery call",
+    "setter",
     "follow-up",
     "follow up",
-    "discovery",
-    "setter",
-    "next steps",
     "rescheduled",
     "reschedule",
+    "next steps",
 )
 
-# Dialer calls are titled with this exact suffix by close_to_attention_sync.
+# Substring that marks a title as a "first sales call" candidate. Combined
+# with FIRST_SALE_EXCLUSION_KEYWORDS to mirror sync.py's is_valid_title().
+FIRST_SALE_TITLE_MARKER = "vendingpren"
+
+# Dialer calls are titled with this exact phrase by close_to_attention_sync.
 # Used to exclude them so the :30 dialer enrichment owns them exclusively.
 DIALER_TITLE_MARKER = "close dialer call"
 
@@ -268,21 +278,43 @@ Respond with ONLY the summary, no preamble."""
 
 
 # ===== Title classification & filtering =====
-def is_followup_candidate(title):
+def is_first_sale_title(title):
     """
-    True if the title looks like a follow-up / discovery / setter / next-steps /
-    rescheduled meeting AND not a Close dialer call.
+    Mirror of sync.py's is_valid_title() — True if this conversation is a
+    first sales call that the :00 sync handles. Keep this function in sync
+    with sync.py.
+    """
+    if not title:
+        return False
+    lower = clean_title(title).lower()
+    if FIRST_SALE_TITLE_MARKER not in lower:
+        return False
+    if any(kw in lower for kw in FIRST_SALE_EXCLUSION_KEYWORDS):
+        return False
+    return True
 
-    Note: we don't need to explicitly exclude first sales calls — they don't
-    contain the FOLLOWUP_KEYWORDS by design (the :00 sync's `is_valid_title()`
-    rejects anything that does). So the keyword check alone is sufficient.
+
+def is_meeting_candidate(title):
+    """
+    Inverse selection: capture every analyzed Attention conversation that
+    ISN'T a first sales call (handled by :00) and ISN'T a Close dialer call
+    (handled by :30). Everything else falls to this sync — follow-ups,
+    discovery calls, setter calls, next-steps reviews, generic "Call with X"
+    titles, internal-tagged sales meetings, "X Vending Consultation" titles
+    that lack the "vendingpren" suffix, etc.
+
+    The Attention list endpoint already filters to analyzed conversations
+    via `filter[hide_non_analyzed]=true`, so we don't need to worry about
+    random unscored noise reaching this filter.
     """
     if not title:
         return False
     lower = clean_title(title).lower()
     if DIALER_TITLE_MARKER in lower:
         return False
-    return any(kw in lower for kw in FOLLOWUP_KEYWORDS)
+    if is_first_sale_title(title):
+        return False
+    return True
 
 
 def classify_meeting_type(title):
@@ -455,9 +487,9 @@ def process_conversation(conv, type_info):
 
     log(f"\n[{uuid}] '{title}'")
 
-    # 1. Title filter
-    if not is_followup_candidate(title):
-        log("→ Title doesn't match follow-up keyword filter, skip", indent=1)
+    # 1. Title filter — capture everything that isn't a first sale or a dialer call
+    if not is_meeting_candidate(title):
+        log("→ Title is a first-sale or dialer call (handled by another sync), skip", indent=1)
         return ("skipped", "title-filter")
 
     # 2. Require completed analysis
