@@ -88,6 +88,12 @@ OBJECTION_CHOICES = ("Timing", "Investment", "Fit", "Other")
 # Source of truth: the ⚡ Meeting Type field in Close.
 MEETING_TYPE_CHOICES = ("Follow-up", "Discovery", "Next Steps", "Setter", "Other")
 
+# Substrings (case-insensitive) in the Attention `labels.Outcome` value that
+# indicate the deal was lost. Outcome-gated to keep Haiku tokens cheap and
+# avoid hallucinating loss reasons on still-open deals. Expand as needed if
+# new Outcome label values are introduced in Attention.
+LOSS_OUTCOME_MARKERS = ("disqualified", "lost", "not interested", "closed lost")
+
 CLOSE_REQUEST_DELAY = 0.5
 
 # Auth setup
@@ -273,6 +279,43 @@ Respond with ONLY the summary, no preamble."""
     resp = requests.post(ANTHROPIC_API_URL, headers=ANTHROPIC_HEADERS, json=payload)
     if not resp.ok:
         log(f"Haiku summarize failed: {resp.status_code}: {resp.text[:300]}", indent=2)
+        return ""
+    return resp.json()["content"][0]["text"].strip()
+
+
+def is_lost_outcome(outcome_label):
+    """True if the Attention Outcome label indicates a lost deal."""
+    if not outcome_label:
+        return False
+    lower = outcome_label.lower()
+    return any(marker in lower for marker in LOSS_OUTCOME_MARKERS)
+
+
+def haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text):
+    """
+    Summarize WHY a deal was lost in <=20 words. Only called when the
+    Attention Outcome label flags the call as lost — this function explains
+    WHY, not WHETHER. Returns "" if there's nothing substantive to summarize.
+    """
+    context = "\n\n".join(s for s in (deal_summary, call_summary, doubt_text) if s)
+    if not context.strip() or len(context.strip()) < 20:
+        return ""
+
+    prompt = f"""This sales call ended with the prospect NOT moving forward with the deal. Summarize the specific reason the deal was lost in 20 words or fewer. Be concrete about what actually killed it (e.g. competing solution, price, timing they can't change, fit issue). Do not editorialize or speculate.
+
+Call context:
+{context[:5000]}
+
+Respond with ONLY the summary, no preamble. If the loss reason is unclear from the context, respond with an empty string."""
+
+    payload = {
+        "model": HAIKU_MODEL,
+        "max_tokens": 60,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = requests.post(ANTHROPIC_API_URL, headers=ANTHROPIC_HEADERS, json=payload)
+    if not resp.ok:
+        log(f"Haiku lost-reason failed: {resp.status_code}: {resp.text[:300]}", indent=2)
         return ""
     return resp.json()["content"][0]["text"].strip()
 
@@ -557,6 +600,15 @@ def process_conversation(conv, type_info):
     key_concern = haiku_summarize_concern(doubt_text)
     log(f"→ {key_concern[:120]}", indent=2)
 
+    # Lost Reason — only summarize if the call's Outcome label indicates loss.
+    outcome_label = (attrs.get("labels") or {}).get("Outcome", "")
+    lost_reason = ""
+    if is_lost_outcome(outcome_label):
+        log(f"Outcome '{outcome_label}' indicates loss; summarizing Lost Reason (Haiku)...", indent=1)
+        deal_summary = get_ei_value(ei, "Deal Summary")
+        lost_reason = haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text)
+        log(f"→ {lost_reason[:120]}", indent=2)
+
     # 7. Classify Meeting Type from title (no model call needed)
     meeting_type = classify_meeting_type(title)
     log(f"Meeting Type: {meeting_type}", indent=1)
@@ -577,6 +629,7 @@ def process_conversation(conv, type_info):
         "QA Score": qa_score,
         "Primary Objection": primary_objection,
         "Key Concern": html_wrap(key_concern),
+        "Lost Reason": html_wrap(lost_reason),
         "Call Summary": html_wrap(call_summary),
         "Call Duration": attrs.get("mediaDuration"),
         "Meeting Type": meeting_type,
