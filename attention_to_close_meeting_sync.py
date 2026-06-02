@@ -752,6 +752,11 @@ def process_conversation(conv, type_info):
                         f"Would update Follow Up Call Show {projected_slot} = {show_value!r}",
                         indent=1,
                     )
+        else:
+            log(
+                f"Meeting Type is {meeting_type!r}; no follow-up slot update applies",
+                indent=1,
+            )
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
