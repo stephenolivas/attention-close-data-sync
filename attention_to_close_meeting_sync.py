@@ -602,9 +602,10 @@ def process_conversation(conv, type_info):
 
     # Lost Reason — only summarize if the call's Outcome label indicates loss.
     outcome_label = (attrs.get("labels") or {}).get("Outcome", "")
+    log(f"Outcome label: {outcome_label!r}", indent=1)
     lost_reason = ""
     if is_lost_outcome(outcome_label):
-        log(f"Outcome '{outcome_label}' indicates loss; summarizing Lost Reason (Haiku)...", indent=1)
+        log("→ Indicates loss; summarizing Lost Reason (Haiku)...", indent=2)
         deal_summary = get_ei_value(ei, "Deal Summary")
         lost_reason = haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text)
         log(f"→ {lost_reason[:120]}", indent=2)
