@@ -63,6 +63,13 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 # the Close Custom Field exactly, or POSTs will fail with a 400.
 OBJECTION_CHOICES = ("Timing", "Investment", "Fit", "Other")
 
+# Substrings (case-insensitive) in the Attention `labels.Outcome` value that
+# indicate the deal was lost. When matched, we run Haiku to summarize the
+# Lost Reason from the call. Anything else (e.g. "Qualified – Not Closed")
+# leaves Lost Reason blank — the deal is still open. Expand this tuple if
+# new Outcome label values are introduced in Attention.
+LOSS_OUTCOME_MARKERS = ("disqualified", "lost", "not interested", "closed lost")
+
 CLOSE_REQUEST_DELAY = 0.5
 
 # Auth setup
@@ -244,6 +251,47 @@ Respond with ONLY the summary, no preamble."""
     resp = requests.post(ANTHROPIC_API_URL, headers=ANTHROPIC_HEADERS, json=payload)
     if not resp.ok:
         log(f"Haiku summarize failed: {resp.status_code}: {resp.text[:300]}", indent=2)
+        return ""
+    return resp.json()["content"][0]["text"].strip()
+
+
+def is_lost_outcome(outcome_label):
+    """True if the Attention Outcome label indicates a lost deal."""
+    if not outcome_label:
+        return False
+    lower = outcome_label.lower()
+    return any(marker in lower for marker in LOSS_OUTCOME_MARKERS)
+
+
+def haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text):
+    """
+    Summarize the reason a deal was lost in <=20 words. Only called when the
+    Attention Outcome label already flags the call as lost — this function
+    explains WHY, not WHETHER.
+
+    Pulls context from Deal Summary first (often explicit about outcome),
+    then Call Summary and Doubt as fallback. Returns "" if there's nothing
+    substantive to summarize.
+    """
+    context = "\n\n".join(s for s in (deal_summary, call_summary, doubt_text) if s)
+    if not context.strip() or len(context.strip()) < 20:
+        return ""
+
+    prompt = f"""This sales call ended with the prospect NOT moving forward with the deal. Summarize the specific reason the deal was lost in 20 words or fewer. Be concrete about what actually killed it (e.g. competing solution, price, timing they can't change, fit issue). Do not editorialize or speculate.
+
+Call context:
+{context[:5000]}
+
+Respond with ONLY the summary, no preamble. If the loss reason is unclear from the context, respond with an empty string."""
+
+    payload = {
+        "model": HAIKU_MODEL,
+        "max_tokens": 60,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = requests.post(ANTHROPIC_API_URL, headers=ANTHROPIC_HEADERS, json=payload)
+    if not resp.ok:
+        log(f"Haiku lost-reason failed: {resp.status_code}: {resp.text[:300]}", indent=2)
         return ""
     return resp.json()["content"][0]["text"].strip()
 
@@ -444,6 +492,17 @@ def enrich_call(close_call, type_info):
     key_concern = haiku_summarize_concern(doubt_text)
     log(f"→ {key_concern[:120]}", indent=2)
 
+    # Lost Reason — only summarize if the call's Outcome label indicates loss.
+    # Saves Haiku tokens on the majority of calls (still-open deals) and avoids
+    # hallucinating loss reasons for calls that aren't actually lost.
+    outcome_label = (attention_attrs.get("labels") or {}).get("Outcome", "")
+    lost_reason = ""
+    if is_lost_outcome(outcome_label):
+        log(f"Outcome '{outcome_label}' indicates loss; summarizing Lost Reason (Haiku)...", indent=1)
+        deal_summary = get_ei_value(ei, "Deal Summary")
+        lost_reason = haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text)
+        log(f"→ {lost_reason[:120]}", indent=2)
+
     # 6. Build Custom Activity payload
     # NOTE: Close Custom Activity "Textarea" fields are parsed as HTML
     # server-side. Key Concern and Call Summary are Textarea-typed and must
@@ -458,6 +517,7 @@ def enrich_call(close_call, type_info):
         "QA Score": qa_score,
         "Primary Objection": primary_objection,
         "Key Concern": html_wrap(key_concern),
+        "Lost Reason": html_wrap(lost_reason),
         "Call Summary": html_wrap(call_summary),
         "Call Duration": attention_attrs.get("mediaDuration") or duration,
         "Close Call Activity ID": call_id,
