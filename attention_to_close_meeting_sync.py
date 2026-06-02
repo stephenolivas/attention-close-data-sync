@@ -94,6 +94,16 @@ MEETING_TYPE_CHOICES = ("Follow-up", "Discovery", "Next Steps", "Setter", "Other
 # new Outcome label values are introduced in Attention.
 LOSS_OUTCOME_MARKERS = ("disqualified", "lost", "not interested", "closed lost")
 
+# Lead-level field IDs for the three "Follow Up Call Show N" slots. Slot 1 is
+# the oldest follow-up, slot 3 the most recent. After 3 follow-ups exist on a
+# lead, additional ones are logged but not written anywhere — Stephen has said
+# they rarely happen, and adding slots 4+ is a deliberate future decision.
+FOLLOW_UP_CALL_SHOW_FIELDS = (
+    "cf_dObuoBvyXtiJr8DD1cwCJroonvji5Bsyog48xig7vBr",  # Slot 1
+    "cf_MDhIC6P8CFyRxwGgEaOygkhgDp2VZeNXNAZKHDUD5Ob",  # Slot 2
+    "cf_AepH7zN22aSBceUoSBZuiYL68wl8CEc5zlGK54bKAjA",  # Slot 3
+)
+
 CLOSE_REQUEST_DELAY = 0.5
 
 # Auth setup
@@ -196,6 +206,20 @@ def close_post(path, json_data):
         time.sleep(CLOSE_REQUEST_DELAY)
         return resp
     raise Exception(f"Close POST {path} exhausted retries")
+
+
+def close_put(path, json_data):
+    url = path if path.startswith("http") else f"{CLOSE_API_BASE}{path}"
+    headers = {**CLOSE_HEADERS, "Content-Type": "application/json"}
+    for attempt in range(6):
+        resp = requests.put(url, headers=headers, json=json_data)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", "2"))
+            time.sleep(wait)
+            continue
+        time.sleep(CLOSE_REQUEST_DELAY)
+        return resp
+    raise Exception(f"Close PUT {path} exhausted retries")
 
 
 # ===== Attention API =====
@@ -517,6 +541,57 @@ def custom_activity_already_exists(lead_id, type_id, attention_uuid, attention_c
     return False
 
 
+# ===== Follow-up slot allocation =====
+def derive_show_value(attendance_label):
+    """Map Attention's Attendance label to 'Yes' / 'No' / None (unknown)."""
+    if not attendance_label:
+        return None
+    lower = attendance_label.lower()
+    if "shown" in lower or "late" in lower:
+        return "Yes"
+    if "no show" in lower or "ghost" in lower:
+        return "No"
+    return None  # unknown → don't overwrite
+
+
+def count_followup_cas_for_lead(lead_id, type_id, meeting_type_field_id):
+    """
+    Count existing 'Attention - Meeting Analysis' Custom Activities on the
+    lead that have Meeting Type == 'Follow-up'. The count INCLUDES the CA
+    we just created (since Close is consistent on subsequent reads), so a
+    return value of 1 means this call IS the first follow-up.
+    """
+    resp = close_get(
+        "/activity/custom/",
+        params={"lead_id": lead_id, "custom_activity_type_id": type_id},
+    )
+    if not resp.ok:
+        return 0
+    count = 0
+    for activity in resp.json().get("data", []):
+        if activity.get(f"custom.{meeting_type_field_id}") == "Follow-up":
+            count += 1
+    return count
+
+
+def update_followup_slot(lead_id, slot_number, show_value):
+    """Write `show_value` ('Yes'/'No') to Follow Up Call Show <slot_number>."""
+    if slot_number < 1 or slot_number > len(FOLLOW_UP_CALL_SHOW_FIELDS):
+        return False
+    field_id = FOLLOW_UP_CALL_SHOW_FIELDS[slot_number - 1]
+    payload = {f"custom.{field_id}": show_value}
+
+    if DRY_RUN:
+        log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
+        return True
+
+    resp = close_put(f"/lead/{lead_id}/", payload)
+    if not resp.ok:
+        log(f"⚠️  Failed to update Follow Up Call Show {slot_number}: {resp.status_code}: {resp.text[:300]}", indent=1)
+        return False
+    return True
+
+
 # ===== Enrichment =====
 def process_conversation(conv, type_info):
     """
@@ -651,6 +726,32 @@ def process_conversation(conv, type_info):
     if DRY_RUN:
         log("DRY_RUN — would POST payload:", indent=1)
         log(json.dumps(payload, indent=2)[:1500], indent=2)
+        # Preview the follow-up slot update too, when applicable.
+        if meeting_type == "Follow-up":
+            attendance_label = (attrs.get("labels") or {}).get("Attendance", "")
+            log(f"Attendance label: {attendance_label!r}", indent=1)
+            show_value = derive_show_value(attendance_label)
+            if show_value is None:
+                log("Attendance unclear; would skip Follow Up Call Show update", indent=1)
+            else:
+                # In DRY_RUN the CA isn't created, so the count reflects what's
+                # ALREADY on the lead. We add 1 to model what would happen after
+                # this new CA lands.
+                meeting_type_field_id = field_ids.get("Meeting Type")
+                existing_count = count_followup_cas_for_lead(
+                    lead_id, type_info["id"], meeting_type_field_id
+                )
+                projected_slot = existing_count + 1
+                if projected_slot > len(FOLLOW_UP_CALL_SHOW_FIELDS):
+                    log(
+                        f"Lead would have {projected_slot} follow-ups; past slot 3, would skip",
+                        indent=1,
+                    )
+                else:
+                    log(
+                        f"Would update Follow Up Call Show {projected_slot} = {show_value!r}",
+                        indent=1,
+                    )
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
@@ -659,6 +760,29 @@ def process_conversation(conv, type_info):
 
     activity_id = resp.json().get("id")
     log(f"✅ Created Custom Activity {activity_id} on lead '{lead_name}'", indent=1)
+
+    # Follow-up slot update — only when Meeting Type is "Follow-up", per spec.
+    # Other meeting types (Discovery, Setter, Next Steps, Other) don't drive
+    # the Follow Up Call Show fields.
+    if meeting_type == "Follow-up":
+        attendance_label = (attrs.get("labels") or {}).get("Attendance", "")
+        log(f"Attendance label: {attendance_label!r}", indent=1)
+        show_value = derive_show_value(attendance_label)
+        if show_value is None:
+            log("Attendance unclear; skipping Follow Up Call Show update", indent=1)
+        else:
+            meeting_type_field_id = field_ids.get("Meeting Type")
+            count = count_followup_cas_for_lead(lead_id, type_info["id"], meeting_type_field_id)
+            if count > len(FOLLOW_UP_CALL_SHOW_FIELDS):
+                log(
+                    f"Lead has {count} Follow-up CAs; past slot 3, no further slots to update",
+                    indent=1,
+                )
+            else:
+                ok = update_followup_slot(lead_id, count, show_value)
+                if ok:
+                    log(f"Updated Follow Up Call Show {count} = {show_value!r}", indent=1)
+
     return ("enriched", activity_id)
 
 
