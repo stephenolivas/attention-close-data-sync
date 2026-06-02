@@ -1,35 +1,31 @@
 #!/usr/bin/env python3
 """
-Attention → Close first-meeting analysis sync (Custom Activity edition).
+Attention → Close meeting analysis sync (everything not a first-sale or dialer).
 
-Captures first sales calls — the same conversations that sync.py at :00
-already processes into LEAD-LEVEL fields — and additionally writes them
-to a Custom Activity of type "Attention - First Meeting Analysis".
+Captures every analyzed Attention conversation that ISN'T already handled by:
+  - sync.py at :00 (first sales calls — title contains "vendingpren" and
+    lacks any of the follow-up exclusion keywords)
+  - attention_to_close_dialer_sync.py at :30 (title contains "Close Dialer Call")
 
-This runs ALONGSIDE sync.py, not as a replacement. sync.py continues
-populating lead-level QA Score / Attention Tier / Max Follow-up Touches /
-First Touch Deadline / Primary Objection / Key Concern / Call Link /
-Call ID / Meeting Title — those drive tier-based smart views and
-workflows in Close. This sync adds a parallel Custom Activity record
-per call so first-sale data has the same shape as dialer and
-everything-else Custom Activities.
+Everything else falls to this sync — follow-ups, discovery calls, setter
+calls, next-steps reviews, generic "Call with X" titles, "X Vending
+Consultation" calls that don't carry the "vendingpren" suffix, etc.
 
-Filter (must satisfy ALL):
-  - Title contains "vendingpren" (the first-sale marker)
-  - Title does NOT contain any of the FIRST_SALE_EXCLUSION_KEYWORDS
-    (follow-up, discovery, setter, next steps, rescheduled, etc.)
-  This mirrors sync.py's is_valid_title() exactly.
+For each in-scope conversation we look up the matching Close lead (by
+prospect email, with a title-only name-extraction fallback for cases like
+"VP follow up with Sophia") and create a Custom Activity of type
+"Attention - Meeting Analysis" with all enrichment fields populated,
+including a ⚡ Meeting Type classification derived from the title.
 
-Hourly schedule slot:
-  :00 - sync.py                                  (first sales → lead fields)
-  :05 - THIS                                     (first sales → Close CA)
-  :15 - close_to_attention_sync.py               (Close dialer recordings → Attention)
-  :30 - attention_to_close_dialer_sync.py        (dialer analyses → Close CA)
-  :45 - attention_to_close_meeting_sync.py       (everything else → Close CA)
+This closes the fourth sync slot in the hourly schedule:
+  :00 - sync.py                              (first sales calls → lead fields)
+  :15 - close_to_attention_sync.py           (Close dialer recordings → Attention)
+  :30 - attention_to_close_dialer_sync.py    (Attention dialer analyses → Close CA)
+  :45 - THIS                                 (Attention everything-else → Close CA)
 
 Required GitHub secrets:
   CLOSE_API_KEY        Close API key (Basic auth)
-  ATTENTION_API_KEY    Attention API key (Bearer prefix for list endpoint)
+  ATTENTION_API_KEY    Attention API key (Bearer prefix used for list endpoint)
   ANTHROPIC_API_KEY    Anthropic API key (for Claude Haiku enrichment)
 
 Optional env vars:
@@ -57,14 +53,15 @@ CLOSE_API_BASE = "https://api.close.com/api/v1"
 ATTENTION_API_BASE = "https://api.attention.tech/v2"
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
-CUSTOM_ACTIVITY_TYPE_NAME = "Attention - First Meeting Analysis"
+CUSTOM_ACTIVITY_TYPE_NAME = "Attention - Meeting Analysis"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 INTERNAL_DOMAIN = "@modern-amenities.com"
 
-# Keep in sync with sync.py's INVALID_TITLE_KEYWORDS — if a title has any
-# of these, it's NOT a first sales call (it's a follow-up / discovery /
-# setter / etc., handled by the :45 sync instead).
+# Keywords that disqualify a title from being a "first sales call" in the
+# :00 sync. Mirrors sync.py's INVALID_TITLE_KEYWORDS — keep in sync if
+# sync.py's filter ever changes. Used here to identify which calls the
+# :00 sync handles (so we can EXCLUDE them).
 FIRST_SALE_EXCLUSION_KEYWORDS = (
     "quick discovery",
     "discovery call",
@@ -80,14 +77,32 @@ FIRST_SALE_EXCLUSION_KEYWORDS = (
 # with FIRST_SALE_EXCLUSION_KEYWORDS to mirror sync.py's is_valid_title().
 FIRST_SALE_TITLE_MARKER = "vendingpren"
 
+# Dialer calls are titled with this exact phrase by close_to_attention_sync.
+# Used to exclude them so the :30 dialer enrichment owns them exclusively.
+DIALER_TITLE_MARKER = "close dialer call"
+
 # Primary Objection dropdown values. Must match Close field config exactly.
 OBJECTION_CHOICES = ("Timing", "Investment", "Fit", "Other")
+
+# Meeting Type dropdown values. Must match Close field config exactly.
+# Source of truth: the ⚡ Meeting Type field in Close.
+MEETING_TYPE_CHOICES = ("Follow-up", "Discovery", "Next Steps", "Setter", "Other")
 
 # Substrings (case-insensitive) in the Attention `labels.Outcome` value that
 # indicate the deal was lost. Outcome-gated to keep Haiku tokens cheap and
 # avoid hallucinating loss reasons on still-open deals. Expand as needed if
 # new Outcome label values are introduced in Attention.
 LOSS_OUTCOME_MARKERS = ("disqualified", "lost", "not interested", "closed lost")
+
+# Lead-level field IDs for the three "Follow Up Call Show N" slots. Slot 1 is
+# the oldest follow-up, slot 3 the most recent. After 3 follow-ups exist on a
+# lead, additional ones are logged but not written anywhere — Stephen has said
+# they rarely happen, and adding slots 4+ is a deliberate future decision.
+FOLLOW_UP_CALL_SHOW_FIELDS = (
+    "cf_dObuoBvyXtiJr8DD1cwCJroonvji5Bsyog48xig7vBr",  # Slot 1
+    "cf_MDhIC6P8CFyRxwGgEaOygkhgDp2VZeNXNAZKHDUD5Ob",  # Slot 2
+    "cf_AepH7zN22aSBceUoSBZuiYL68wl8CEc5zlGK54bKAjA",  # Slot 3
+)
 
 CLOSE_REQUEST_DELAY = 0.5
 
@@ -121,7 +136,11 @@ def normalize_field_name(name):
 
 
 def clean_title(title):
-    """Strip recording upload suffixes — mirrors sync.py."""
+    """
+    Strip recording upload suffixes like:
+      ' - 2026_04_23 13_26 PDT - Recording.mp4'
+    Mirrors the existing sync.py behavior so titles compare consistently.
+    """
     if not title:
         return title
     return re.sub(
@@ -136,9 +155,13 @@ def html_wrap(text):
     Wrap plain text for Close Custom Activity Textarea fields.
 
     Close's "Textarea" type is parsed as XHTML server-side and specifically
-    requires <body>...</body> wrapping and self-closing void elements
-    (<br/>, not <br>). See the dialer enrichment script for the full
-    debugging history of this format.
+    requires:
+      - <body>...</body> wrapper
+      - Self-closing void elements (<br/>, not <br>)
+      - HTML-escaped special characters (`&`, `<`, `>`)
+    For empty / None input, returns the input unchanged so the caller's
+    "skip empty values" logic still applies. See the dialer enrichment
+    script's docstring for the full debugging history of this format.
     """
     if not text:
         return text
@@ -185,11 +208,26 @@ def close_post(path, json_data):
     raise Exception(f"Close POST {path} exhausted retries")
 
 
+def close_put(path, json_data):
+    url = path if path.startswith("http") else f"{CLOSE_API_BASE}{path}"
+    headers = {**CLOSE_HEADERS, "Content-Type": "application/json"}
+    for attempt in range(6):
+        resp = requests.put(url, headers=headers, json=json_data)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", "2"))
+            time.sleep(wait)
+            continue
+        time.sleep(CLOSE_REQUEST_DELAY)
+        return resp
+    raise Exception(f"Close PUT {path} exhausted retries")
+
+
 # ===== Attention API =====
 def attention_list_conversations(since_dt):
     """
     Fetch Attention conversations finished after `since_dt`. Returns a list
-    of {id, attributes} items. Mirrors sync.py's call pattern.
+    of {id, attributes} items. Mirrors sync.py's pattern (Bearer auth +
+    filter[hide_non_analyzed] + fromDateTime).
     """
     from_dt = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     url = f"{ATTENTION_API_BASE}/conversations"
@@ -306,11 +344,12 @@ Respond with ONLY the summary, no preamble. If the loss reason is unclear from t
     return resp.json()["content"][0]["text"].strip()
 
 
-# ===== Title filter =====
+# ===== Title classification & filtering =====
 def is_first_sale_title(title):
     """
-    Mirror of sync.py's is_valid_title(). True if this is a first sales call.
-    Keep in sync with sync.py if its filter ever changes.
+    Mirror of sync.py's is_valid_title() — True if this conversation is a
+    first sales call that the :00 sync handles. Keep this function in sync
+    with sync.py.
     """
     if not title:
         return False
@@ -320,6 +359,51 @@ def is_first_sale_title(title):
     if any(kw in lower for kw in FIRST_SALE_EXCLUSION_KEYWORDS):
         return False
     return True
+
+
+def is_meeting_candidate(title):
+    """
+    Inverse selection: capture every analyzed Attention conversation that
+    ISN'T a first sales call (handled by :00) and ISN'T a Close dialer call
+    (handled by :30). Everything else falls to this sync — follow-ups,
+    discovery calls, setter calls, next-steps reviews, generic "Call with X"
+    titles, internal-tagged sales meetings, "X Vending Consultation" titles
+    that lack the "vendingpren" suffix, etc.
+
+    The Attention list endpoint already filters to analyzed conversations
+    via `filter[hide_non_analyzed]=true`, so we don't need to worry about
+    random unscored noise reaching this filter.
+    """
+    if not title:
+        return False
+    lower = clean_title(title).lower()
+    if DIALER_TITLE_MARKER in lower:
+        return False
+    if is_first_sale_title(title):
+        return False
+    return True
+
+
+def classify_meeting_type(title):
+    """
+    Map a title to one of the ⚡ Meeting Type dropdown values. Priority order
+    matters when a title contains multiple keywords (e.g. "discovery follow-up
+    rescheduled" — Follow-up wins, then Discovery, etc.). Adjust if you want
+    different precedence later.
+    """
+    if not title:
+        return "Other"
+    lower = title.lower()
+    if "follow up" in lower or "follow-up" in lower:
+        return "Follow-up"
+    if "discovery" in lower:
+        return "Discovery"
+    if "next steps" in lower:
+        return "Next Steps"
+    if "setter" in lower:
+        return "Setter"
+    # rescheduled / reschedule → Other (no dedicated dropdown value)
+    return "Other"
 
 
 # ===== Attention data extraction =====
@@ -344,29 +428,26 @@ def get_prospect_email(participants):
 
 def extract_prospect_name_from_title(title):
     """
-    First-sale titles follow the pattern "<Name> and Vendingpreneur(s) Consultation".
-    Extract the prefix before "and vending..." as the candidate prospect name.
-    Mirrors sync.py's titles_match() extraction logic.
-
-    Examples:
-      'Tara Fiddler and Vendingpreneurs Consultation' → 'Tara Fiddler'
-      'Hutchison Heberer and Vendingprenuers Consultation' → 'Hutchison Heberer'
+    Title-only fallback: extract a candidate prospect name from common
+    follow-up title patterns like:
+      'VP follow up with Sophia'           → 'Sophia'
+      'Follow up with Hiram Axton Jr'      → 'Hiram Axton Jr'
+      'VendingPreneurs follow up with Kelley' → 'Kelley'
+    Titles without an explicit "with X" segment yield None and fall through
+    to skip-and-log. Capitalization-bounded so we don't accidentally swallow
+    trailing prepositions ("...with John on Tuesday" → "John").
     """
     if not title:
         return None
-    lower = clean_title(title).lower()
-    for separator in (" and vending", "and vendingpren"):
-        idx = lower.find(separator)
-        if idx > 0:
-            name = title[:idx].strip()
-            if len(name) > 3:
-                return name
+    m = re.search(r"\bwith\s+((?:[A-Z][a-zA-Z\.]*\s*)+)", title)
+    if m:
+        return m.group(1).strip()
     return None
 
 
 # ===== Custom Activity Type resolution =====
 def find_custom_activity_type():
-    """Resolve {id, fields_by_name} for the Attention - First Meeting Analysis type."""
+    """Resolve {id, fields_by_name} for the Attention - Meeting Analysis type."""
     resp = close_get("/custom_activity/")
     if not resp.ok:
         raise Exception(
@@ -397,7 +478,7 @@ def find_custom_activity_type():
 
 # ===== Close lead matching =====
 def find_close_lead_by_email(email):
-    """Search Close for a lead with this contact email."""
+    """Search Close for a lead with this contact email. Returns lead dict or None."""
     if not email:
         return None
     resp = close_get(
@@ -434,10 +515,12 @@ def find_close_lead_by_title(title):
     leads = resp.json().get("data", [])
     if not leads:
         return None
+    # Prefer exact substring match in display_name
     name_lower = name.lower()
     for lead in leads:
         if name_lower in (lead.get("display_name") or "").lower():
             return lead
+    # If only one result, accept it (single-candidate match)
     if len(leads) == 1:
         return leads[0]
     return None
@@ -458,11 +541,63 @@ def custom_activity_already_exists(lead_id, type_id, attention_uuid, attention_c
     return False
 
 
+# ===== Follow-up slot allocation =====
+def derive_show_value(attendance_label):
+    """Map Attention's Attendance label to 'Yes' / 'No' / None (unknown)."""
+    if not attendance_label:
+        return None
+    lower = attendance_label.lower()
+    if "shown" in lower or "late" in lower:
+        return "Yes"
+    if "no show" in lower or "ghost" in lower:
+        return "No"
+    return None  # unknown → don't overwrite
+
+
+def count_followup_cas_for_lead(lead_id, type_id, meeting_type_field_id):
+    """
+    Count existing 'Attention - Meeting Analysis' Custom Activities on the
+    lead that have Meeting Type == 'Follow-up'. The count INCLUDES the CA
+    we just created (since Close is consistent on subsequent reads), so a
+    return value of 1 means this call IS the first follow-up.
+    """
+    resp = close_get(
+        "/activity/custom/",
+        params={"lead_id": lead_id, "custom_activity_type_id": type_id},
+    )
+    if not resp.ok:
+        return 0
+    count = 0
+    for activity in resp.json().get("data", []):
+        if activity.get(f"custom.{meeting_type_field_id}") == "Follow-up":
+            count += 1
+    return count
+
+
+def update_followup_slot(lead_id, slot_number, show_value):
+    """Write `show_value` ('Yes'/'No') to Follow Up Call Show <slot_number>."""
+    if slot_number < 1 or slot_number > len(FOLLOW_UP_CALL_SHOW_FIELDS):
+        return False
+    field_id = FOLLOW_UP_CALL_SHOW_FIELDS[slot_number - 1]
+    payload = {f"custom.{field_id}": show_value}
+
+    if DRY_RUN:
+        log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
+        return True
+
+    resp = close_put(f"/lead/{lead_id}/", payload)
+    if not resp.ok:
+        log(f"⚠️  Failed to update Follow Up Call Show {slot_number}: {resp.status_code}: {resp.text[:300]}", indent=1)
+        return False
+    return True
+
+
 # ===== Enrichment =====
 def process_conversation(conv, type_info):
     """
     Process one Attention conversation. Returns ('enriched', activity_id) on
-    success, ('skipped', reason) when filtered out or unmatched.
+    success, ('skipped', reason) when filtered out or unmatched, and raises
+    on Close API errors so the caller's try/except can record it as failed.
     """
     attrs = conv.get("attributes", {})
     uuid = attrs.get("uuid") or conv.get("id", "")
@@ -470,9 +605,9 @@ def process_conversation(conv, type_info):
 
     log(f"\n[{uuid}] '{title}'")
 
-    # 1. Title filter — keep only first sales calls
-    if not is_first_sale_title(title):
-        log("→ Not a first sales call (handled by another sync), skip", indent=1)
+    # 1. Title filter — capture everything that isn't a first sale or a dialer call
+    if not is_meeting_candidate(title):
+        log("→ Title is a first-sale or dialer call (handled by another sync), skip", indent=1)
         return ("skipped", "title-filter")
 
     # 2. Require completed analysis
@@ -485,7 +620,7 @@ def process_conversation(conv, type_info):
         )
         return ("skipped", "not-analyzed")
 
-    # 3. Resolve Close lead — email primary, "X and Vendingpreneurs" title fallback
+    # 3. Resolve Close lead — email primary, title-name fallback
     prospect_email = get_prospect_email(attrs.get("participants", []))
     matched_lead = None
     match_method = None
@@ -550,13 +685,18 @@ def process_conversation(conv, type_info):
         lost_reason = haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text)
         log(f"→ {lost_reason[:120]}", indent=2)
 
-    # 7. Build payload
+    # 7. Classify Meeting Type from title (no model call needed)
+    meeting_type = classify_meeting_type(title)
+    log(f"Meeting Type: {meeting_type}", indent=1)
+
+    # 8. Build payload
     # Notes:
     # - Close Custom Activity "Textarea" fields require <body>...</body> XHTML;
     #   see html_wrap docstring. Key Concern and Call Summary need wrapping.
-    # - "Close Call Activity ID" exists on the Custom Activity Type (mirrored
-    #   from the dialer template) but doesn't apply to first-sale video calls.
-    #   The "skip empty values" loop below omits None values from the payload.
+    # - "Close Call Activity ID" field is intentionally left unpopulated:
+    #   it exists on the Custom Activity Type (mirrored from the dialer one)
+    #   but doesn't apply to video meetings. The "skip empty values" loop
+    #   below omits None values from the payload cleanly.
     attention_link = f"https://app.attention.tech/conversations/{uuid}"
     field_mapping = {
         "Attention Call Link": attention_link,
@@ -568,6 +708,7 @@ def process_conversation(conv, type_info):
         "Lost Reason": html_wrap(lost_reason),
         "Call Summary": html_wrap(call_summary),
         "Call Duration": attrs.get("mediaDuration"),
+        "Meeting Type": meeting_type,
     }
 
     payload = {
@@ -585,6 +726,32 @@ def process_conversation(conv, type_info):
     if DRY_RUN:
         log("DRY_RUN — would POST payload:", indent=1)
         log(json.dumps(payload, indent=2)[:1500], indent=2)
+        # Preview the follow-up slot update too, when applicable.
+        if meeting_type == "Follow-up":
+            attendance_label = (attrs.get("labels") or {}).get("Attendance", "")
+            log(f"Attendance label: {attendance_label!r}", indent=1)
+            show_value = derive_show_value(attendance_label)
+            if show_value is None:
+                log("Attendance unclear; would skip Follow Up Call Show update", indent=1)
+            else:
+                # In DRY_RUN the CA isn't created, so the count reflects what's
+                # ALREADY on the lead. We add 1 to model what would happen after
+                # this new CA lands.
+                meeting_type_field_id = field_ids.get("Meeting Type")
+                existing_count = count_followup_cas_for_lead(
+                    lead_id, type_info["id"], meeting_type_field_id
+                )
+                projected_slot = existing_count + 1
+                if projected_slot > len(FOLLOW_UP_CALL_SHOW_FIELDS):
+                    log(
+                        f"Lead would have {projected_slot} follow-ups; past slot 3, would skip",
+                        indent=1,
+                    )
+                else:
+                    log(
+                        f"Would update Follow Up Call Show {projected_slot} = {show_value!r}",
+                        indent=1,
+                    )
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
@@ -593,16 +760,40 @@ def process_conversation(conv, type_info):
 
     activity_id = resp.json().get("id")
     log(f"✅ Created Custom Activity {activity_id} on lead '{lead_name}'", indent=1)
+
+    # Follow-up slot update — only when Meeting Type is "Follow-up", per spec.
+    # Other meeting types (Discovery, Setter, Next Steps, Other) don't drive
+    # the Follow Up Call Show fields.
+    if meeting_type == "Follow-up":
+        attendance_label = (attrs.get("labels") or {}).get("Attendance", "")
+        log(f"Attendance label: {attendance_label!r}", indent=1)
+        show_value = derive_show_value(attendance_label)
+        if show_value is None:
+            log("Attendance unclear; skipping Follow Up Call Show update", indent=1)
+        else:
+            meeting_type_field_id = field_ids.get("Meeting Type")
+            count = count_followup_cas_for_lead(lead_id, type_info["id"], meeting_type_field_id)
+            if count > len(FOLLOW_UP_CALL_SHOW_FIELDS):
+                log(
+                    f"Lead has {count} Follow-up CAs; past slot 3, no further slots to update",
+                    indent=1,
+                )
+            else:
+                ok = update_followup_slot(lead_id, count, show_value)
+                if ok:
+                    log(f"Updated Follow Up Call Show {count} = {show_value!r}", indent=1)
+
     return ("enriched", activity_id)
 
 
 # ===== Main =====
 def main():
     section(
-        f"Attention → Close first-meeting sync "
+        f"Attention → Close meeting analysis sync "
         f"(HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN})"
     )
 
+    # 1. Resolve Custom Activity Type
     section("Resolving Close Custom Activity Type")
     type_info = find_custom_activity_type()
     log(f"Type:   {CUSTOM_ACTIVITY_TYPE_NAME}")
@@ -611,11 +802,13 @@ def main():
     for name, field_id in sorted(type_info["fields"].items()):
         log(f"  {name}: {field_id}", indent=1)
 
+    # 2. Fetch Attention conversations
     since_dt = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     section(f"Fetching Attention conversations since {since_dt.isoformat()}")
     conversations = attention_list_conversations(since_dt)
     log(f"Total returned: {len(conversations)}")
 
+    # 3. Process each conversation
     section("Processing conversations")
     stats = {"enriched": 0, "skipped": 0, "failed": 0}
     skip_reasons = {}
