@@ -618,12 +618,22 @@ def process_conversation(conv, type_info):
     # 2. Require completed analysis
     sc = attrs.get("scorecardResults") or []
     ei = attrs.get("extractedIntelligence") or {}
-    if not sc or not ei:
+    # Require SOMETHING to work with. Scorecard-only is fine (setter-style
+    # scorecards may not emit extractedIntelligence). Only skip if both
+    # are missing — that indicates Attention hasn't finished analysis at all.
+    if not sc and not ei:
         log(
             f"→ Attention analysis not yet complete (scorecard={len(sc)}, EI={len(ei)}), skip",
             indent=1,
         )
         return ("skipped", "not-analyzed")
+
+    if not ei:
+        log(
+            "Note: no extractedIntelligence (likely setter scorecard); "
+            "proceeding with scorecard-only fields",
+            indent=1,
+        )
 
     # 3. Resolve Close lead — email primary, "X and Vendingpreneurs" title fallback
     prospect_email = get_prospect_email(attrs.get("participants", []))
