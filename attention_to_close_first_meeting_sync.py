@@ -498,8 +498,13 @@ def derive_qualified_value(outcome_label):
     if not outcome_label:
         return None
     lower = outcome_label.lower()
+    # Order matters: check "disqualified" first because "qualified" is a
+    # substring of it. Check "one call close" early since it's the most
+    # specific positive-signal label.
     if "disqualified" in lower:
         return "No"
+    if "one call close" in lower:
+        return "Yes"
     if "qualified" in lower:
         return "Yes"
     if "lost" in lower or "not interested" in lower:
@@ -508,15 +513,30 @@ def derive_qualified_value(outcome_label):
 
 
 def get_lead_overrides(lead_id):
-    """Fetch the show + qualified override field values for a lead in one call."""
-    fields = f"id,custom.{FIRST_CALL_SHOW_OVERRIDE_FIELD},custom.{QUALIFIED_OVERRIDE_FIELD}"
+    """
+    Fetch override field values AND the current Qualified value for a lead
+    in one call. The current Qualified value is used to implement the
+    "don't overwrite once populated" rule — the rep's judgment (or a
+    previous automation write) wins.
+    """
+    fields = (
+        f"id,"
+        f"custom.{FIRST_CALL_SHOW_OVERRIDE_FIELD},"
+        f"custom.{QUALIFIED_OVERRIDE_FIELD},"
+        f"custom.{QUALIFIED_FIELD}"
+    )
     resp = close_get(f"/lead/{lead_id}/", params={"_fields": fields})
     if not resp.ok:
-        return {"show_override": None, "qualified_override": None}
+        return {
+            "show_override": None,
+            "qualified_override": None,
+            "qualified_current": None,
+        }
     data = resp.json()
     return {
         "show_override": data.get(f"custom.{FIRST_CALL_SHOW_OVERRIDE_FIELD}"),
         "qualified_override": data.get(f"custom.{QUALIFIED_OVERRIDE_FIELD}"),
+        "qualified_current": data.get(f"custom.{QUALIFIED_FIELD}"),
     }
 
 
@@ -545,6 +565,14 @@ def update_lead_show_and_qualified(lead_id, attendance_label, outcome_label):
     if qualified_value is not None:
         if (overrides["qualified_override"] or "").lower() == "yes":
             log("Qualified Override is 'Yes' — leaving field untouched", indent=1)
+        elif overrides["qualified_current"]:
+            # Rep may have manually judged this differently, or a previous run
+            # populated it. Either way, respect the existing value.
+            log(
+                f"Qualified already set to {overrides['qualified_current']!r} — "
+                f"leaving field untouched (rep judgment wins)",
+                indent=1,
+            )
         else:
             payload[f"custom.{QUALIFIED_FIELD}"] = qualified_value
 
