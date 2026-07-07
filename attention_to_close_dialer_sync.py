@@ -458,10 +458,21 @@ def enrich_call(close_call, type_info):
     # 2. Check processing completeness
     sc = attention_attrs.get("scorecardResults") or []
     ei = attention_attrs.get("extractedIntelligence") or {}
-    if not sc or not ei:
+    # Require SOMETHING to work with. Scorecard-only is fine (setter
+    # scorecards don't emit extractedIntelligence; we still want to capture
+    # QA Score and basic call metadata). Only skip if both are missing —
+    # that indicates Attention hasn't finished analysis at all.
+    if not sc and not ei:
         log("→ Attention analysis not yet complete, skip (will retry next run)", indent=1)
         log(f"  scorecardResults: {len(sc)}, extractedIntelligence: {len(ei)}", indent=2)
         return None
+
+    if not ei:
+        log(
+            "Note: no extractedIntelligence (likely setter scorecard); "
+            "proceeding with scorecard-only fields",
+            indent=1,
+        )
 
     # 3. Idempotency check
     field_ids = type_info["fields"]
