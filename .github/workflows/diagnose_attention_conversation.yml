@@ -1,0 +1,46 @@
+name: Diagnose Attention Conversation
+
+# Manual-trigger only. Takes an Attention conversation UUID, dumps the
+# structured shape of the response to the run log, and uploads the full
+# raw JSON as a downloadable artifact for detailed inspection.
+#
+# Intended usage: inspecting non-standard scorecard responses (setter
+# scorecards, etc.) so we know what fields to extract in the enrichment
+# syncs. Not on a schedule — nothing about this needs to be recurring.
+on:
+  workflow_dispatch:
+    inputs:
+      conversation_uuid:
+        description: 'Attention conversation UUID to inspect'
+        required: true
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run diagnostic
+        env:
+          ATTENTION_API_KEY: ${{ secrets.ATTENTION_API_KEY }}
+        run: python3 -u diagnose_attention_conversation.py "${{ inputs.conversation_uuid }}"
+
+      - name: Upload raw JSON artifact
+        if: always()  # upload even if the script errored, for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: attention-diagnostic-${{ inputs.conversation_uuid }}
+          path: attention_diagnostic_*.json
+          if-no-files-found: warn
+          retention-days: 7
